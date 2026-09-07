@@ -1,0 +1,63 @@
+menu "ToF Height Estimation"
+
+    choice APP_MODE
+        prompt "Application run mode"
+        default APP_MODE_SST_CSV
+
+        config APP_MODE_SST_CSV
+            bool "Single-sensor: 8x8 distance logger"
+        config APP_MODE_SST_REPEAT
+            bool "Single-sensor: repeatability"
+        config APP_MODE_SST_SPECULAR
+            bool "Single-sensor: specular response"
+        config APP_MODE_SST_WATER
+            bool "Single-sensor: water level"
+        config APP_MODE_HEIGHT_DEMO
+            bool "Height demo (1000 mm placeholder baseline)"
+    endchoice
+
+    config APP_REPEAT_FRAME_COUNT
+        int "Repeatability frame count"
+        range 2 10000
+        default 100
+
+    config APP_WATER_INSTALL_HEIGHT_MM
+        int "Sensor installation height (mm)"
+        range 1 10000
+        default 1000
+
+    config APP_OUTPUT_INTERVAL_MS
+        int "Serial output interval (ms)"
+        range 100 60000
+        default 5000
+
+    comment "Low-power sender defaults (the UI overrides these at runtime)"
+
+    config APP_DEFAULT_SLEEP_S
+        int "Default sleep seconds (0 disables sleep)"
+        range 0 3600
+        default 25
+        help
+            Boot value until A pushes a CONFIG_SET. Demo profile 1 is 25 s and
+            profile 2 is 10 s. Set 0 to keep the node awake continuously, which
+            is useful when debugging over USB.
+
+    config APP_DEFAULT_WAKE_S
+        int "Default wake window seconds"
+        range 1 3600
+        default 10
+        help
+            Total active window of one cycle, not an extra wait added after the
+            measurement.
+
+    config APP_DEFAULT_MEASURE_COUNT
+        int "Measurements per wake window"
+        range 1 10
+        default 1
+
+    config APP_MEASURE_ATTEMPTS
+        int "Attempts per measurement before giving up"
+        range 1 10
+        default 3
+
+endmenu

@@ -1,0 +1,1720 @@
+# ToF 프로젝트 macOS 이전 및 실행 SPEC
+
+## 0. 문서 목적
+
+이 문서는 Windows의 `C:\esp\ToF` 프로젝트를 MacBook의 ESP-IDF 환경으로 옮긴 결과와,
+ToF/LoRa 2-node 수조 시연을 완성하기 위한 기준서다.
+
+1. ESP32-S3 펌웨어를 macOS에서 재현 빌드한다.
+2. B-1/B-2의 VL53L8CX 8×8 측정과 SX1262 LoRa 송신을 확인한다.
+3. Mac에 연결된 A에서 두 노드의 거리/상태/RSSI/SNR을 수신한다.
+4. 웹 UI에서 sleep/wake/측정 주기를 바꾸고 실제 저전력 동작을 시연한다.
+
+이 문서는 2026-08-15에 폴더의 실제 소스, 기존 빌드 결과 및 구매 영수증을 기준으로
+최초 작성했고, 2026-08-27에 Mac 빌드/USB/실기 결과와 최종 A/B-1/B-2 요구사항을
+반영했다. 2026-08-28에는 세 보드의 실기 진단 결과, ToF 미검출의 실제 원인,
+A↔B-1↔B-2 무선 검증, protocol v2 구현을 반영했다. 2026-09-03에는 light sleep과 두
+runtime profile의 실기 검증, A bridge와 Mac 로컬 UI 구현, 그리고 운용 중 발견한
+전원 관련 제약을 반영했다. 2026-09-06에는 B-1 센서 불량 확정, 측정 대상 반사율의
+영향, B-2 baseline 실측, UI의 연속 곡면·수조 뷰·위치 스캔 페이지를 반영했다. 확인하지 못한 PCB revision은 `확인 필요`로 명시한다.
+
+---
+
+## 0.1 최신 적용 기준 (2026-09-06)
+
+이 절은 2026-09-06까지의 실제 코드, 빌드 결과, 세 보드 실기 시험 및 무선 검증을
+반영한 **현재 기준선**이다. 뒤쪽 절에는 최초 macOS 이전 당시의 조사와 설계 기록도
+보존되어 있다. 두 내용이 충돌하면 이 절의 상태와 작업 순서를 우선 적용한다.
+
+최종 목표는 Mac에 항상 연결된 A가 LoRa 수신기 겸 설정 중계기로 동작하고, 배터리로
+독립 운용되는 B-1과 B-2가 서로 다른 위치와 방향에서 같은 수조 구간을 측정하는 것이다.
+시연 중에는 로컬 웹 UI에서 sleep/wake/측정 설정을 변경하고 2~3분 안에 두 전력 운용
+프로파일의 차이를 보여준다.
+
+### 0.1.1 장치 역할과 현재 식별 정보
+
+**장치 식별은 MAC 주소로만 한다.** 세 보드의 CP2102가 같은 USB serial 문자열을
+보고하기 때문에 macOS는 `/dev/cu.usbserial-*` 이름을 **꽂은 순서대로** 배정한다.
+같은 보드가 상황에 따라 `-0001`이 되기도 하고 `-3`이 되기도 한다. 2026-08-27
+기록에서 A와 B-1의 포트가 뒤바뀌어 적혔던 것이 이 때문이며, 그 결과 B-1에 올렸다고
+믿은 진단 펌웨어가 실제로는 A에서 실행됐다. 플래시 전에는 반드시
+`esptool.py -p <port> read_mac`으로 대상을 확인한다.
+
+| 장치 | 최종 역할 | 전원/연결 | MAC (고정 식별자) | 현재 상태 (2026-09-03) |
+|---|---|---|---|---|
+| A | LoRa 수신기 + Mac/UI 설정 bridge | 항상 USB-C로 Mac 연결 | `44:1b:f6:fb:ea:a4` | **bridge 동작 중.** protocol v2 |
+| B-1 | ToF 측정 + LoRa 송신 노드 1 | 최종적으로 배터리 독립 운용 | `44:1b:f6:f9:60:c8` | **배선 수리 중(동료).** 저전력 sender v2 |
+| B-2 | ToF 측정 + LoRa 송신 노드 2 | 최종적으로 배터리 독립 운용 | `44:1b:f6:fa:a1:a0` | **정상 동작 확인.** 저전력 sender v2 |
+
+#### 전원 관련 운용 규칙 (2026-09-03 발견)
+
+실기에서 두 가지 제약을 확인했다. 둘 다 반복해서 시간을 잡아먹었으므로 규칙으로
+고정한다.
+
+1. **배터리가 연결되어 있으면 USB가 열거되지 않는다.** 보드가 이미 급전된 상태라
+   C-C 전원 협상이 성립하지 않는다. `/dev/cu.usbserial*`에 아예 나타나지 않으므로
+   **플래시나 모니터 전에는 배터리를 분리한다.** 처음에는 Heltec V3.0의 C-to-C
+   미지원 문제로 오인했으나, 배터리를 빼면 같은 케이블로 정상 연결된다.
+2. **저전력 모드에서는 USB 충전기가 출력을 끊는다.** light sleep이 걸리면 평균
+   소비전류가 크게 떨어지는데, 다수의 충전기와 보조배터리는 부하가 일정 수준
+   아래로 내려가면 기기가 분리된 것으로 판단해 전원을 차단한다. 역설적으로 저전력이
+   잘 동작할수록 발생한다. **시연과 저전력 시험은 반드시 Li-Po 배터리로 한다.**
+
+시험 중 B 노드에 안정적인 전원이 필요하면 맥북이 아닌 별도 USB 전원을 쓴다. 데이터
+연결이 필요 없으므로 케이블 종류는 무관하며, C-C 한 개로 A만 연결한 채 B 노드를
+따로 급전할 수 있다.
+
+A, B-1, B-2 세 보드 모두 863~928 MHz용 LoRa 안테나 장착을 확인했다. 안테나 없이
+LoRa 송신을 실행하지 않는다. `i2cdiag` 역할은 SX1262를 초기화하지 않으므로 송신이
+없고, 안테나 없이도 안전하게 실행할 수 있다.
+
+B-1과 B-2 모두 VL53L8CX 8×8 측정과 LoRa 송신이 실기로 확인됐고, Pololu carrier
+헤더 납땜도 완료했다. B-1은 이후 배선 문제가 남아 동료가 수리 중이다(0.1.3절).
+
+최종 데이터 및 설정 경로는 다음과 같다.
+
+```text
+Mac 로컬 웹 UI (127.0.0.1)
+          ↕ USB serial
+A: LoRa 수신기 + 설정 bridge
+          ↕ 양방향 point-to-point LoRa
+ B-1: node_id=1          B-2: node_id=2
+ ToF + 배터리            ToF + 배터리
+```
+
+#### 빌드 환경 — venv가 두 개다 (2026-09-06)
+
+이 프로젝트의 `build_a` / `build_b2`는 VS Code Espressif 확장이 만든
+`~/.espressif/tools/python/v5.4.4/venv`로 configure되어 있다. 그런데
+`export.sh`는 표준 경로인 `~/.espressif/python_env/idf5.4_py3.13_env`만 찾는다.
+후자가 없으면 export가 실패하고, 있더라도 서로 다른 venv라서 빌드가
+
+```text
+'...python_env/...' is currently active in the environment while the project was
+configured with '...tools/python/v5.4.4/venv'. Run 'idf.py fullclean' to start again.
+```
+
+로 멈춘다. **`fullclean` 하지 말고 프로젝트가 쓰던 venv를 지정한다.**
+
+```bash
+export IDF_PYTHON_ENV_PATH=/Users/hanjiin/.espressif/tools/python/v5.4.4/venv
+. /Users/hanjiin/.espressif/v5.4.4/esp-idf/export.sh
+```
+
+flash 전에는 항상 MAC으로 대상을 확인한다(0.1.1절). baud는 115200을 쓴다 —
+460800에서 실패한 적이 있다.
+
+```bash
+python -m esptool -p /dev/cu.usbserial-0001 read_mac
+idf.py -B build_a -p /dev/cu.usbserial-0001 -b 115200 flash
+```
+
+### 0.1.2 현재 구현 및 검증 상태
+
+| 항목 | 상태 | 확인 내용 / 남은 일 |
+|---|---|---|
+| ESP-IDF macOS 환경 | 완료 | ESP-IDF v5.4.4, target `esp32s3` 기준 빌드 성공 |
+| 외부 SX1262 드라이버 | 완료 | `external/esp-idf-sx126x`, commit `f5e0e7a2bb5d136d13f1d5c095de59a1e6224acf` |
+| LoRa radio wrapper | 완료 | `components/lora_radio`; **A↔B-1, A↔B-2 실기 송수신 검증 완료** |
+| LoRa protocol v2 | 구현·호스트 테스트 완료 | `components/lora_protocol`; 6종 packet, 64-bit 누적시간, config/ACK, CRC16 |
+| 역할별 펌웨어 | 구현·빌드 완료 | `diagnostic`, `sender`, `receiver`, **`i2cdiag`** 4종 clean build |
+| B-2 ToF 실기 | **확인 완료** | 8×8 프레임 안정 수신, `valid=64/64`, `retries=0` |
+| B-1 ToF 실기 | **센서 불량 확정** | 교차 시험으로 특정. **Pololu #3419 carrier 교체 대기**(0.1.3절) |
+| 헤더 납땜 | 완료 | B-1/B-2 Pololu carrier |
+| protocol v2 업로드 | 완료 | 세 보드 모두 v2 |
+| **ESP light sleep** | **검증 완료** | 25초/10초 모두 실측(`last_sleep=24999 / 9999 ms`) |
+| **SX1262 warm sleep/wake** | **검증 완료** | sleep 후 복귀해 정상 송신 |
+| **VL53L8CX SLEEP/WAKEUP** | **검증 완료** | 복귀 후 8×8 정상 |
+| **프로파일 1 / 2** | **검증 완료** | 25/10/1, 10/10/1 모두 무선 전환으로 동작 |
+| **A bridge** | **구현·검증 완료** | `main/bridge.c`. 설정 queue, CONFIG_SET downlink, ACK/재시도, 재부팅 자동 복구 |
+| **Mac 로컬 UI** | **구현 완료** | `tools/ui/`. B-2 실시간 표시까지 확인 |
+| B-2 배터리 운용 | **정상** | 배터리만으로 동작. 원인은 송신 출력(0.1.11절) |
+| 두 노드 동시 + TX slot | 미검증 | B-1 복구 후 |
+| inline meter 전력 실측 | 미착수 | 계측기 필요 |
+| 호스트 테스트 | 완료 | geometry, height, pipeline, lora_protocol 총 4개 통과 (v2 기준) |
+
+2026-08-28 실기 무선 검증 결과는 다음과 같다.
+
+| 항목 | 결과 |
+|---|---|
+| A↔B-1 거리 약 2 m | RSSI −48 dBm, SNR 13 dB, 8×8 프레임 정상 |
+| A↔B-2 | RSSI −36 dBm, SNR 12 dB, 8×8 프레임 정상 |
+| 두 노드 동시 운용 | A에서 `node_id` 1/2로 정상 구분 |
+| 보드 밀착 시 | RSSI −16 dBm으로 수신기 포화 근처. 링크 품질 측정은 1 m 이상 띄우고 수행 |
+
+2026-09-03에는 저전력 cycle과 설정 downlink를 실기로 검증했다.
+
+| 항목 | 결과 |
+|---|---|
+| 프로파일 1 적용 | `CFG 2 25 10 1` → ACK → 다음 cycle부터 `cfg=25s/10s/x1` |
+| ESP light sleep 25초 | `last_sleep=24999ms` (요청값이 아니라 `esp_timer` 실측) |
+| 프로파일 2 적용 | `CFG 2 10 10 1` → `last_sleep=9999ms` |
+| wake window | WAKE→SLEEPING 간격이 정확히 10초 |
+| 측정 재시도 | `retries=0` — 첫 프레임 폐기 처리가 유효 |
+| 전원 재투입 후 자동 복구 | 노드 재부팅 감지 → `CONFIG_SET` 재전송 → ACK → 재적용 |
+
+즉 **B 노드를 물리적으로 건드리지 않고 무선으로만 프로파일을 전환할 수 있다.**
+카트리지가 봉인된 뒤에도 같은 방법이 통한다.
+
+TX slot은 구현·테스트했으나 아직 송신 경로에 연결하지 않았다. 두 노드가 각자
+부팅 시각 기준의 독립 주기로 송신하는 동안에는 고정 offset이 충돌 확률을 낮추지
+못하기 때문이다. wake가 동기화되는 조건에서 의미가 생기므로 두 노드 동시 운용
+검증 때 함께 붙인다. 현재 조건에서 SF7/BW125/186 byte 기준 airtime은 약 290 ms,
+주기 10초이므로 충돌 확률은 약 5%다.
+
+역할별 빌드 산출물도 생성되어 있다.
+
+| 용도 | 빌드 디렉터리 | sdkconfig | 역할 |
+|---|---|---|---|
+| A | `build_a` | `sdkconfig.a` | `receiver` (= bridge) |
+| B-1 | `build_b1` | `sdkconfig.b1` | `sender`, `APP_NODE_ID=1` |
+| B-2 | `build_b2` | `sdkconfig.b2` | `sender`, `APP_NODE_ID=2` |
+| 배선 진단 | `build_i2cdiag` | `sdkconfig.i2cdiag` | `i2cdiag` |
+
+빌드 예:
+
+```bash
+idf.py -B build_b2 -DSDKCONFIG=sdkconfig.b2 \
+       -DAPP_NODE_ROLE=sender -DAPP_NODE_ID=2 build
+```
+
+**B 노드의 부팅 기본값은 `sleep_s=0`(상시 동작)으로 둔다.** 설정은 RAM에만 있으므로
+전원을 껐다 켜면 이 값으로 돌아오는데, 이것이 봉인된 카트리지에서 가장 안전한
+상태다. light sleep 쪽에 문제가 생겨 노드가 멈추더라도 전원만 다시 넣으면 항상
+깨어 있는 상태로 복귀해 A의 명령을 받을 수 있다. `sleep_s=25`를 기본값으로 구우면
+같은 문제로 멈췄을 때 카트리지를 열어야 한다.
+
+업로드 시 ESP에는 부트로더(`0x0`), partition table(`0x8000`), 컴파일된 app
+image(`0x10000`)가 기록된다. C 소스와 `sdkconfig`가 원문 파일 그대로 업로드되는 것은
+아니며, 컴파일·링크 결과가 app image에 포함된다. 일반 역할 변경 업로드에서는 NVS를
+일괄 삭제하지 않는다.
+
+### 0.1.3 ToF 미검출의 실제 원인과 남은 조치
+
+2026-08-27에 기록한 `ESP_ERR_NOT_FOUND` 3회는 **센서 불량도 배선 구성 오류도
+아니었다.** 2026-08-28 진단으로 원인이 두 가지로 확정됐다.
+
+**원인 1 — 대상 보드 오인.** 포트 이름을 신원으로 믿고 `/dev/cu.usbserial-3`에
+진단 펌웨어를 올렸으나 그 포트는 A였다. A에는 ToF 센서가 연결되어 있지 않으므로
+`vl53l8cx_is_alive()` 실패는 당연한 결과였다. 0.1.1절의 MAC 확인 절차를 따르면
+재발하지 않는다.
+
+**원인 2 — Pololu carrier 헤더 미납땜.** Pololu #3419은 헤더 핀을 납땜하지 않은
+상태로 출고되며, 현재 두 B 노드 모두 핀을 끼워만 둔 상태다. 이 때문에 `VIN`, `GND`,
+`SDA`, `SCL` 접점이 각각 독립적으로 붙었다 떨어진다. 과거에 8×8이 보였다가 이후
+보이지 않게 된 것도 이 접촉이 우연히 유지되었다가 보드를 움직이며 깨진 것이다.
+
+진단은 `APP_NODE_ROLE=i2cdiag` 빌드로 수행한다. 이 역할은 멀티미터 없이 다음을
+구분한다.
+
+| 관찰 | 의미 |
+|---|---|
+| 내부 pull-up OFF 상태에서 SDA/SCL = 1 | carrier에 전원이 있고 해당 선이 연결됨 |
+| 내부 pull-up OFF 상태에서 어느 한쪽 = 0 | 그 선이 접촉되지 않음 |
+| 내부 pull-up OFF에서 둘 다 0 | `VIN` 또는 `GND` 접촉 불량 |
+| 내부 pull-up ON에서도 0 | 해당 선이 GND에 단락 |
+| `device_id=0xF0 revision_id=0x0C` | 센서 정상 (ULD `is_alive` 기준값) |
+
+이 진단으로 B-1과 B-2 모두 센서·배선 구성·펌웨어가 정상임을 확인했고, 손으로
+접점을 누른 상태에서 연속 8×8 프레임과 LoRa 송신까지 성공했다.
+
+납땜은 완료했다. B-1과 B-2의 Pololu #3419에서 실제로 사용하는 핀은 `VIN`, `GND`,
+`SDA/MOSI`, `SCL/MCLK`, `SPI/I2C`이며, `INT`와 `SYNC`는 polling 방식이라 쓰지 않는다.
+
+#### 납땜 이후 — B-1 센서 불량 확정 (2026-09-06)
+
+**B-2는 완전히 정상**이 됐다. `valid=64/64`, `retries=0`으로 안정 동작한다.
+
+**B-1은 VL53L8CX 자체가 손상된 것으로 확정됐다.** 세 요소를 하나씩 분리해 확인했다.
+
+| 대상 | 방법 | 결과 |
+|---|---|---|
+| 배선 | 멀티미터 도통 확인 | 정상 |
+| **B-1 보드 + B-2 센서** | 교차 연결 | **8×8 안정 출력** |
+| B-1 보드 + B-1 센서 | | 전 주소 무응답 |
+
+보드와 배선이 각각 독립적으로 정상임이 증명됐으므로 남는 것은 센서뿐이다. 이
+교차 시험이 결정적이었고, 그 전까지의 추정(I2C 속도, 전원 배선, 접촉 불량)은 모두
+틀렸다.
+
+**증상의 변화**
+
+| 시점 | 증상 |
+|---|---|
+| 납땜 직후 | `tof_init` 성공(84 KB 업로드, 매번 정확히 2330 ms) → `start_ranging`에서만 실패 |
+| 이후 | 버스 전 주소 무응답. 50/100/400/1000 kHz 모두 동일 |
+
+I2C 속도는 원인이 아니다. 동료의 Arduino 테스트가 같은 조건(GPIO41/42, `0x29`,
+8×8, 10 Hz, 400 kHz, `VIN`은 고정 `3V3`)에서 190 프레임 이상 정상 동작했으므로
+펌웨어 설정 문제도 아니었다.
+
+**메커니즘 — carrier 레귤레이터의 hiccup**
+
+`i2cdiag`의 라인 판독을 12회 샘플링으로 고친 뒤 패턴이 분명해졌다.
+
+```
+SDA=0/12  SCL=0/12    (both low: VIN or GND is open)
+SDA=12/12 SCL=12/12   (both wires connected and carrier powered)
+SDA=0/12  SCL=0/12
+...  약 2초 주기로 반복, 중간값은 한 번도 없음
+```
+
+24회 판독이 전부 깨끗한 `0/12` 또는 `12/12`였다. **접촉 불량이면 샘플 중간값이
+나와야 하는데 한 번도 없었다.** 이는 기계적 단속이 아니라 **Pololu carrier의
+레귤레이터가 보호 모드로 들어갔다 복귀하기를 반복**하는 것이다. 손상된 센서가
+과전류를 끌면 레귤레이터가 출력을 끊고, 부하가 사라지면 복귀하고, 다시 끊긴다.
+그때마다 carrier의 pull-up이 함께 죽으므로 두 선이 동시에 `0/12`가 된다.
+
+**조치**: Pololu #3419 carrier를 **통째로 교체**한다. VL53L8CX가 carrier 기판에
+직접 실장되어 있어 센서만 분리할 수 없다. 보드와 배선은 검증됐으므로 교체 후
+`i2cdiag`로 `ALIVE` + 8×8을 확인하고 곧바로 sender를 올리면 된다.
+
+**손상된 센서는 재사용하지 않는다.** 다른 보드에 물리면 그 보드의 레일도 끌어내린다.
+
+#### 진단 도구에서 고친 것
+
+라인 레벨 판독에 **안정화 지연과 다중 샘플링**이 없어 잘못된 결론을 유도했다.
+I2C 드라이버가 방금 놓은 핀을 재설정하자마자 읽으면 잔류 전하를 읽게 되어, 실제로는
+안정적인 상태가 초당 요동치는 것처럼 보였다. 지금은 5 ms 대기 후 3 ms 간격으로
+12회 샘플링해 `SDA=7/12` 같은 중간값으로 진짜 간헐 단선을 구분한다.
+
+**측정 도구 자체를 의심하는 것도 진단의 일부다.** 이 결함 때문에 배선을 두 번
+재작업했다.
+
+#### 펌웨어에 넣은 대응
+
+손이 닿지 않는 카트리지 안에서도 스스로 회복하도록 sender에 두 가지를 넣었다.
+
+- **I2C 속도 자동 폴백** — 400 kHz → 100 kHz → 50 kHz 순으로 시도하고 성공한 속도를
+  기억해 다음 cycle에 먼저 쓴다. 성공 시 `ToF init ok at 400 kHz in 2330 ms`처럼
+  어느 속도로 몇 ms 걸렸는지 로그에 남는다. `i2cdiag`도 같은 네 속도를 훑는다.
+- **Vext 기반 센서 전원 재투입** — `tof_deinit()`은 I2C만 정리하고 센서 전원은
+  끊지 않으므로, 브라운아웃으로 굳은 센서는 재초기화를 반복해도 살아나지 않는다.
+  `start_ranging` 실패 직후와 모든 속도 실패 시 GPIO36으로 300 ms 전원을 끊었다
+  넣는다. `VIN`이 고정 `3V3`에 물린 노드에서는 무해한 no-op이다.
+- **`ranging_hz` 10 → 5** — 적분 시간이 길어져 어두운 표면에서 신호가 늘어난다.
+  wake당 프레임을 1장만 쓰므로 주파수를 낮춰도 잃는 것이 없다. 동료의 Arduino도
+  5 Hz였다.
+
+### 0.1.4 현재 구현된 LoRa 기준선
+
+현재 프로젝트는 Heltec WiFi LoRa 32 V3 계열의 내장 **Semtech SX1262**를 대상으로
+한다. 드라이버와 프로젝트의 현재 핀/무선 설정은 다음과 같다.
+
+| 항목 | 설정 |
+|---|---|
+| SPI | SPI2, SCLK GPIO 9, MOSI GPIO 10, MISO GPIO 11 |
+| SX1262 제어 | NSS GPIO 8, RESET GPIO 12, BUSY GPIO 13 |
+| RF 제어 | TCXO 1.8 V 사용, DIO2 RF switch 사용 |
+| 주파수/방식 | point-to-point 922.1 MHz |
+| 출력/변조 | **5 dBm**, SF7, BW 125 kHz, CR 4/5, preamble 8, CRC on |
+
+`sdkconfig`의 `CONFIG_433MHZ=y`는 외부 드라이버 저장소의 **예제 앱에서만** 참조되며
+본 프로젝트 빌드에는 영향을 주지 않는다. 실제 주파수는 `lora_radio.h`의
+`LORA_RADIO_FREQUENCY_HZ = 922100000`이 `LoRaBegin()`에 직접 전달되고,
+`CalibrateImage()`도 이 값을 사용한다. 혼동을 줄이려면 언젠가 `CONFIG_915MHZ=y`로
+바꿔두는 것이 좋으나 동작에는 무관하다.
+
+#### protocol v2 (2026-08-28 구현, 업로드 대기)
+
+v1은 폐기하고 v2로 교체했다. v1과는 wire 호환되지 않으므로 **세 보드를 모두 v2로
+교체해야** 통신이 성립한다(동시에 연결할 필요는 없고, 한 대씩 순서대로 올리면 된다).
+
+모든 uplink packet이 48 byte 공통 헤더를 공유하므로 A와 UI는 어떤 packet을 받든
+항상 최신 설정과 시간 telemetry를 얻는다.
+
+| packet | 크기 | 방향 |
+|---|---:|---|
+| `WAKE` / `STATUS` | 50 B | B → A |
+| `CONFIG_ACK` | 51 B | B → A |
+| `SLEEPING` | 54 B | B → A |
+| `FRAME` | 186 B | B → A |
+| `CONFIG_SET` | 16 B | A → B |
+
+공통 헤더는 magic/version/type/node ID, sequence, `config_revision`, 적용 중인
+`sleep_s`/`wake_s`/`measure_count`, `retry_count`, 그리고 0.1.6절이 요구한 시간
+telemetry(`awake_elapsed_ms`, `last_sleep_ms`, 64-bit `total_awake_ms` /
+`total_sleep_ms`, `wake_count`)를 담는다. FRAME은 여기에 valid mask와 64개 거리값을
+더한다. 최대 186 byte로 SX1262의 packet 상한 255 byte 안에 들어간다.
+
+설치 방향(rotation/mirror)은 **노드 설정에 포함하지 않는다.** 0.1.8절이 원본 8×8
+matrix 보존을 요구하므로 방향 변환은 UI 표시 단계에서만 적용한다.
+
+`lora_protocol_tx_slot_offset_ms()`는 구현·테스트했으나 **현재 sender에는 연결하지
+않았다.** 지금은 두 노드가 각자 부팅 시각 기준의 독립 주기로 송신하므로 고정 offset을
+더해도 충돌 확률이 줄지 않는다. wake가 동기화되는 저전력 sender에서 의미가 생긴다.
+
+현재 sender(`main/sender_lowpower.c`)는 0.1.6절의 cycle을 그대로 구현하고 실기에서
+검증됐다. 한 cycle은 다음과 같다.
+
+```text
+pending 설정 적용 → wake_start 기록 → node TX slot 대기
+  → WAKE 송신 → 설정 수신 400 ms
+  → 센서 WAKEUP(실패 시 재init) → ranging 시작 → 첫 프레임 폐기
+  → 측정 measure_count회(각각 최대 3회 시도) → FRAME 송신
+  → ranging stop → 센서 SLEEP        (측정 직후. 아래 참조)
+  → wake window 남은 시간 동안 설정 수신
+  → SLEEPING 송신 → radio warm sleep → ESP light sleep
+  → 복귀 후 radio wakeup(실패 시 full init)
+```
+
+0.1.6절의 순서와 두 곳이 다르며, 둘 다 실기 결과를 반영한 것이다.
+
+- **첫 프레임을 버린다.** `start_ranging` 직후 첫 프레임은 관측된 모든 cycle에서
+  유효 zone이 0이었고 두 번째부터 실측값이 나왔다. 재시도로 때우지 않고 명시적으로
+  폐기해 재시도 예산을 아낀다. 이 처리 이후 `retries=0`이 유지된다.
+- **ranging을 wake window 끝이 아니라 측정 직후에 멈춘다.** ranging은 약 100 mA를
+  소모하는데 측정이 끝난 뒤에는 센서가 필요 없다. window 내내 켜두면 전력을 낭비하고,
+  실제로 그 상태에서 `tof_stop_ranging`이 반복 실패했다.
+
+`lora_radio_wakeup()`은 SPI로 더미 바이트를 보내 NSS에 하강 에지를 만든 뒤 명령을
+보낸다. 잠든 SX1262는 BUSY를 HIGH로 유지하는데 드라이버의 모든 명령이 BUSY를 먼저
+기다리므로, 명령만으로는 칩을 깨울 수 없기 때문이다.
+
+### 0.1.5 최종 2~3분 시연 프로파일
+
+측정 횟수는 두 프로파일 모두 wake window당 **1회**이고, 센서 초기화/측정 복구는
+이미 정한 최대 **3회 재시도**를 유지한다. 설정값은 펌웨어에 고정하지 않고 웹 UI에서
+B-1, B-2 또는 두 노드에 적용할 수 있게 한다.
+
+| 프로파일 | sleep | wake window | wake당 측정 | 이상적 wake duty 비율 |
+|---|---:|---:|---:|---:|
+| 1 | 25초 | 10초 | 1회, 실패 시 최대 3회 재시도 | 10/(25+10) = 28.6% |
+| 2 | 10초 | 10초 | 1회, 실패 시 최대 3회 재시도 | 10/(10+10) = 50.0% |
+
+프로파일 1을 두 cycle 실행하면 약 70초, 프로파일 2를 세 cycle 실행하면 약 60초이므로
+전환/설명을 포함해 2~3분 시연에 맞출 수 있다. 실제 센서 준비 및 LoRa airtime 때문에
+경계 시각에는 작은 오차가 생길 수 있으며, wake 10초는 측정 완료 후 무조건 추가되는
+10초가 아니라 한 cycle의 전체 활성 window로 정의한다.
+
+UI에는 최소한 다음 입력과 표시가 필요하다.
+
+- sleep seconds, wake seconds, wake당 측정 횟수
+- 프로파일 1/2 preset과 사용자 지정값
+- 적용 대상 B-1/B-2/둘 다, 설정 revision, pending/ACK/applied 상태
+- 각 노드의 WAKE/MEASURING/TX/SLEEP 상태와 마지막 수신 시각
+- 8×8 matrix, frame sequence, RSSI/SNR, 오류 및 재시도 횟수
+- 직전 sleep, 누적 sleep, 누적 가동시간, 계산된 duty 비율
+
+### 0.1.6 최종 저전력 동작 설계
+
+현재 B 센서 carrier의 `VIN`은 고정 `3V3`에 연결되어 있어 GPIO 36의 Vext를 꺼도 센서
+전원이 차단되지 않는다. 따라서 배선을 바꾸지 않는 현재 시연에서는 다음 조합을 우선
+구현한다.
+
+- ESP32-S3: timer wakeup 기반 light sleep
+- VL53L8CX: ranging 정지 후 ULD power mode `SLEEP`, 복귀 시 `WAKEUP`
+- SX1262: warm-start sleep, 복귀 후 상태/IRQ를 확인하고 필요하면 재초기화
+
+현재 VL53L8CX component wrapper에는 power-mode API가 노출되어 있지 않고,
+`lora_radio`에도 고수준 sleep/wakeup 함수가 없으므로 두 wrapper를 확장해야 한다.
+단순 `vTaskDelay`는 CPU가 깨어 있으므로 최종 저전력 기능으로 인정하지 않는다.
+
+권장 B 노드 cycle은 다음과 같다.
+
+```text
+ESP timer wake
+  → WAKE status 송신 및 노드별 radio slot 대기
+  → A가 대기시킨 새 설정 수신, revision 검사 및 ACK
+  → VL53L8CX WAKEUP/초기화 복구
+  → 8×8 측정 1회(실패 시 총 3회까지 시도)
+  → 측정 frame 송신
+  → 설정된 10초 wake window가 끝날 때까지 설정 수신
+  → ranging stop → VL53L8CX SLEEP
+  → SLEEPING status → SX1262 warm sleep
+  → 설정된 시간만큼 ESP light sleep
+```
+
+새 설정은 ACK 후 **다음 cycle부터 적용**하는 것으로 정의해 시각과 표시의 모호함을
+없앤다. v1의 `uptime_ms` 32-bit 값은 약 49.7일에 wrap되고 light sleep 시간까지
+포함해 의미가 모호했으므로, protocol v2에서 다음과 같이 나눴다(구현 완료).
+
+- `awake_elapsed_ms`: 현재/직전 wake window에서 실제 깨어 있던 시간
+- `last_sleep_ms`: 직전 실제 sleep 시간
+- `total_awake_ms`, `total_sleep_ms`: 64-bit 누적값
+- `wake_count`, `config_revision`, 현재 `sleep_s/wake_s/measure_count`
+
+### 0.1.7 A bridge와 Mac UI (구현 완료)
+
+A는 단순 수신기가 아니라 Mac과 두 B 노드 사이의 설정 bridge다. `main/bridge.c`에
+구현되어 있고 `APP_NODE_ROLE=receiver`로 빌드된다.
+
+#### serial 명령 (Mac → A)
+
+한 줄에 하나씩, 사람이 직접 타이핑할 수도 있고 UI가 보낼 수도 있다.
+
+| 명령 | 뜻 |
+|---|---|
+| `CFG <node> <sleep_s> <wake_s> <measure>` | 해당 노드에 설정을 queue한다. revision은 A가 자동으로 올린다 |
+| `STATUS` | 두 노드의 현재 설정 상태를 출력한다 |
+| `MODE HUMAN\|JSON\|BOTH` | 출력 형식. 기본은 `HUMAN` |
+
+`MODE`가 필요한 이유는 FRAME 하나에 거리값이 64개 들어가서, 사람이 읽는 로그와
+JSON을 동시에 뿜으면 콘솔에서 명령을 칠 수 없기 때문이다. UI는 접속하면서
+`MODE JSON`을 자동으로 보낸다.
+
+#### 이벤트 (A → Mac)
+
+`{"v":2,"ev":...}` 형식의 JSON line이다. `v`는 스키마 버전으로, UI가 모르는 펌웨어를
+조용히 오독하지 않고 거부할 수 있게 한다. `ev`는 `WAKE` / `FRAME` / `STATUS` /
+`SLEEPING` / `CONFIG_ACK` / `config`이며, 공통 필드로 node, seq, rssi, snr, rev,
+sleep_s, wake_s, measure, retries와 시간 telemetry를 싣는다. FRAME은 여기에
+`valid`, `valid_mask`, 64개 `d`를 더한다.
+
+#### 설정 downlink 상태 기계
+
+1. `CFG` 명령을 받으면 revision을 올리고 `pending`으로 둔다.
+2. 그 노드의 **`WAKE`를 받은 순간** `CONFIG_SET`을 보낸다. 노드가 확실히 듣고 있는
+   유일한 시점이기 때문이다.
+3. `CONFIG_ACK`를 받으면 `acked`. 최대 4회까지 재시도하고 그래도 없으면 `failed`.
+4. **노드의 `wake_count`가 뒤로 가면 재부팅으로 판단해 자동으로 다시 밀어넣는다.**
+   설정이 RAM에만 있어 전원이 빠지면 초기화되는데, 봉인된 카트리지에서는 이 자동
+   복구가 없으면 손을 쓸 수 없다. revision 비교가 아니라 wake_count 역행으로
+   판단하는 이유는, ACK 직후의 프레임이 아직 적용 전이라 옛 revision을 보고하는데
+   이를 재부팅으로 오인하면 매번 불필요하게 재전송하기 때문이다.
+5. ACK했는데 두 wake가 지나도 여전히 옛 설정을 보고하면 적용 실패로 보고 재전송한다.
+
+ACK가 담는 revision은 **수락한 revision**이다(초기 구현은 적용 중인 revision을
+보냈고, A가 이를 거부로 오판했다). A는 두 경우를 모두 받아들이도록 되어 있다.
+
+##### A 재시작 후 revision 역전 (2026-09-06, 수정 완료)
+
+`CFG`가 부여하는 revision은 A의 RAM에 있는 `node->desired.revision + 1`이었다.
+A를 다시 flash하거나 USB가 빠지면 이 값이 0으로 돌아가는데, 노드는 이전 세션의
+번호를 그대로 들고 있다. 그래서 A가 재시작한 뒤의 첫 `CFG`는 노드보다 낮은
+revision을 보내고, 노드는 `revision < applied.revision` 조건에 걸려
+`REJECTED_STALE`(result=2)로 거절한다.
+
+실제로 노드가 rev=4일 때 A가 rev=3을 보내 거절당했다. 더 나쁜 것은 이 상태에서
+`CFG`를 한 번 더 쳐서 rev=4가 되면, 노드가 "이미 아는 revision"으로 판단해
+**설정을 바꾸지 않은 채 성공 ACK를 돌려준다**는 점이다. A는 `acked`로 표시하고
+끝내며, 미적용 감지 분기는 `보고 revision < desired`를 요구하므로 `4 < 4`가 거짓이라
+영원히 풀리지 않는다. 노드보다 **엄격히 큰** 번호로 건너뛰어야 한다.
+
+거절 한 번을 확인하는 데 wake 한 주기가 든다. 25초 주기에서는 성가신 정도지만
+`sleep_s=3600`에서는 시도마다 최대 1시간이라 사실상 복구가 불가능하다.
+
+수정은 `main/bridge.c`에 `last_reported_rev`를 두어, CONFIG_ACK 이외의 uplink가
+싣고 오는 실제 동작 중 revision을 기록하고 `queue_config()`가 **자기 카운터와
+노드 보고값 중 큰 쪽 + 1** 을 쓰도록 했다. CONFIG_ACK을 쓰지 않는 이유는 위에
+적은 대로 그 헤더의 revision이 구현에 따라 다르기 때문이다.
+
+#### 화면 구성 — 사용자와 관리자 (2026-09-07)
+
+UI는 세 페이지다. 모두 같은 `server.py`가 서빙하고 외부 리소스를 참조하지 않는다.
+
+| 경로 | 파일 | 대상 | 내용 |
+|---|---|---|---|
+| `/` | `home.html` | — | 프로그램명 **빗물 지킴이** + 사용자/관리자 진입 |
+| `/user` | `user.html` | 일반 사용자 | 서울시 지도, 지점 10개, 클릭 시 등급과 적치 % |
+| `/admin` | `index.html` | 운영자 | 기존 모니터 + 상단 판정 블록 |
+| `/survey` | `survey.html` | 운영자 | 한 센서를 두 위치로 옮기는 스캔 |
+
+##### 4단계 등급
+
+`server.py`의 `LEVELS` 한 곳에만 정의하고 `/api/state`와 `/api/sites`로 내려보낸다.
+두 페이지가 같은 표를 받으므로 등급 기준이 어긋날 수 없다.
+
+| 등급 | 색 | 하한 | 의미 |
+|---|---|---:|---|
+| 비움 | 파랑 `#3b82f6` | 0% | 바닥이 드러남. 배수 정상 |
+| 양호 | 초록 `#22c55e` | 15% | 소량 적치. 배수에 지장 없음 |
+| 주의 | 노랑 `#eab308` | 40% | 적치 진행 중. 청소 권장 |
+| 위험 | 빨강 `#ef4444` | 70% | 배수 불가 임박. 즉시 조치 |
+
+초안은 base/안전/적치/위험이었다. 네 이름이 한 줄에 놓이면 축이 섞여 보인다 —
+base는 기준선, 안전은 판단, 적치는 원인, 위험은 결과다. **적치 정도라는 한 축**으로
+통일했다. 이름과 임계값은 `LEVELS` 배열만 고치면 두 화면에 함께 반영된다.
+
+##### 적치 % 계산
+
+`Store._assess_locked()`가 계산한다.
+
+1. 노드가 보고하는 **`wake_count`로 프레임을 묶는다.** 도착 시각이 아니라 wake
+   단위로 묶어야 짧게 끝난 window가 직전 window의 프레임으로 채워지지 않는다.
+2. 그 window에서 zone별로 **valid한 샘플만 평균**낸다.
+3. `높이 = baseline − 평균거리`, 이를 유효 zone 전체에 대해 평균낸다.
+4. `적치% = 높이 / 깊이 × 100` (0~100 clamp). 깊이는 `depth_mm` 설정값이고,
+   비워두면 **baseline 평균 거리**(= 빈 수조에서 잰 센서–바닥 거리)를 쓴다.
+
+판정 블록은 항상 **몇 프레임 · 몇 zone으로 계산했는지 함께 표시한다.** 3프레임만
+왔는데 "10프레임 평균"이라고 적으면 시연 당일 스스로를 속이게 된다.
+
+`FILL_MIN_FRAMES`(3) 미만이면 아직 채워지는 중인 새 window 대신 **직전 window**를
+쓴다. 그래서 wake 경계에서 값이 1프레임짜리로 튀지 않는다.
+
+지점 값은 **두 노드 적치%의 평균**이고, 등급은 그 평균을 표에서 다시 찾아 정한다.
+노드별 등급 중 하나를 고르면 (예: 0%와 80%) 평균 40%인데 "위험"이 붙는 불일치가
+생긴다 — 실제로 초안에 있던 버그다.
+
+##### 사용자 지도
+
+`SEOUL_SITES` 10개 중 **첫 번째만 실측**(서울시립대학교, 동대문구 서울시립대로 163)
+이고 나머지 9개는 고정된 표본값이다. 새로고침마다 값이 바뀌면 고장으로 보이므로
+난수를 쓰지 않는다.
+
+지도는 **행정구역 25개 구 경계**를 그린다. 출처는 통계청 2013년 자료를 정리한
+`southkorea/seoul-maps`의 `seoul_municipalities_geo_simple.json`이고, 좌표를
+소수점 4자리(약 10 m)로 줄여 `user.html`에 **인라인으로 박아 넣었다**(약 26 KB).
+지도 타일이나 외부 스크립트를 전혀 받지 않으므로 오프라인에서 그대로 뜬다.
+위경도는 `cos(37.56°)`로 보정해 투영한다 — 보정하지 않으면 서울이 눈에 띄게
+세로로 늘어난다.
+
+구 이름은 링의 shoelace 무게중심에 찍는다. 25개 전부 자기 구역 안에 들어가는 것을
+확인했고, **지점 10개가 각각 주소상의 구 안에 실제로 들어가는지도 점 포함 판정으로
+검증했다**(10/10 일치). 선택된 지점이 속한 구는 옅게 강조된다.
+
+한강은 그리지 않는다. 구 경계 데이터에 강이 없고 대략적인 선을 얹으면 정확한
+경계와 어긋나 보이기 때문이다.
+
+##### 공개 화면의 디자인 기준 (2026-09-07)
+
+`home.html`과 `user.html`은 **흰 배경의 공공 서비스 화면** 어법을 따른다. 관리자
+화면(`index.html`)은 어두운 계기판 그대로 두었다 — 보는 사람과 목적이 다르다.
+
+- 색: 남색 `#12335c`(머리글), 파랑 `#1a6fd4`(동작), 배경 흰색과 `#f4f7fb`
+- 서체: 시스템 산세리프만 사용(`-apple-system`, `Apple SD Gothic Neo` 등).
+  웹폰트를 받지 않는다
+- 모서리 반경 3~4 px, 실선 테두리, 그림자 최소
+
+이 때문에 `LEVELS`에 **`ink` 필드**를 더했다. `color`는 점과 막대를 채우는 색이고
+어두운 관리자 화면에서 잘 읽히지만, 흰 배경에 `#eab308`로 큰 글씨를 쓰면 읽히지
+않는다. `ink`는 같은 색을 어둡게 낮춘 값이다. 두 값은 항상 같이 다니므로 등급 색이
+절반만 바뀌는 일이 없다.
+
+##### 시연 프로파일
+
+`CFG <node> 25 10 10` — 25초 sleep, 10초 wake, wake당 10회 측정. 실측 로그 기준
+첫 프레임이 awake 1426 ms, 이후 약 390 ms 간격이므로 10프레임에 **약 4.9초**가
+들고 나머지 5초가 설정 downlink 창으로 남는다. 20초 wake는 필요 없다.
+`measure_count` 상한은 10이다(`CONFIG_MAX_MEASURE_COUNT`).
+
+#### Mac 로컬 UI
+
+`tools/ui/`에 있다. 외부 웹 서비스가 아니라 `127.0.0.1`에서 도는 로컬 프로그램이며,
+표준 라이브러리 HTTP server와 PySerial만 쓴다(Flask 등 web framework 없음). 페이지는
+외부 리소스를 전혀 참조하지 않아 오프라인에서 동작한다.
+
+```bash
+. /Users/hanjiin/.espressif/v5.4.4/esp-idf/export.sh
+python3 tools/ui/server.py --port /dev/cu.usbserial-XXXX
+# http://127.0.0.1:8765
+```
+
+시리얼 포트는 한 프로그램만 잡을 수 있으므로 **`idf.py monitor`를 먼저 닫는다.**
+
+제공하는 것: 노드별 카드(연결·RSSI/SNR·설정·revision·bridge 설정 상태), wake 횟수와
+직전/누적 sleep 및 **duty 비율 자동 계산**, 8×8 컬러 그리드, 프로파일 1/2/상시
+버튼과 커스텀 입력, **빈 수조 baseline 캡처**(디스크에 보존)와 baseline 대비 높이
+표시, 노드별 회전·반전, 아이소메트릭 3D 막대 뷰.
+
+원본 프레임은 수신한 그대로 보관하고 **회전·반전은 표시 단계에서만 적용한다.**
+0.1.8절이 요구하는 원본 보존 조건이다.
+
+#### 표시 방식 (2026-09-06)
+
+노드 카드마다 그림이 둘이다.
+
+- **연속 곡면** — 8×8을 Catmull-Rom으로 52×52까지 보간한 아이소메트릭 곡면.
+  보간은 **측정한 64개 점을 정확히 지나가고**(수치 검증 완료, 오차 0), 실제
+  baseline에서 오버슈트는 0.7 mm였다. 기울기에 따라 밝기를 변조해 입체감을 준다.
+- **수조 안 zone별 막대** — 원래의 이산 표현을 수조 상자(바닥 격자, 뒷벽, 모서리
+  기둥, 상단 테두리) 안에 넣은 것. 어느 zone이 무엇을 보고했는지 그대로 읽힌다.
+  아이소메트릭 깊이가 `행+열`에 비례하므로 대각선 단위로 먼 쪽부터 그린다.
+
+두 그림 모두 **커버리지가 없는 zone은 그리지 않는다.** 곡면 쪽은 보간을 매끄럽게
+하려고 값은 이웃에서 채우되 커버리지 격자를 따로 보간해, 절반 미만인 영역은 칠하지
+않는다. 없는 지형을 만들어내지 않기 위해서다.
+
+#### baseline 캡처
+
+`빈 수조를 baseline으로` 버튼은 최근 **16프레임의 zone별 중앙값**을 쓴다.
+
+- **유효한 샘플만 사용한다.** 무효 zone의 거리 필드에는 신뢰할 수 없는 값이 들어
+  있어, 그것을 섞으면 baseline이 오염된다. 검은 바닥처럼 `----`가 잦은 환경에서
+  특히 문제가 된다.
+- zone마다 **유효 샘플이 5개 이상**이어야 baseline을 인정하고, 부족하면 그 zone은
+  비워 둔다. 높이 모드에서 `—`로 표시되고 3D에서도 그려지지 않는다.
+- 프레임 수는 16으로 정했다. 랜덤 오차는 샘플 수의 제곱근에 반비례하므로 16이면
+  1/4로 줄고, 그 이상은 설치 각도·표면 특성 같은 계통 오차가 지배해 실익이 급감한다.
+
+수집을 서두를 때는 `CFG <node> 0 10 4`로 wake당 측정을 4회로 올리면 40초면 16장이
+찬다. **끝나면 반드시 시연 프로파일로 되돌린다** — `sleep_s=0`에 측정 4회는 가장
+전력을 많이 쓰는 조합이고, 실제로 이 상태로 오래 두어 배터리가 방전된 적이 있다.
+
+#### 위치 스캔 페이지 `/survey` (2026-09-06)
+
+B-1을 못 쓰는 동안 **한 센서를 두 위치로 옮겨가며** 수조를 훑기 위한 페이지다.
+위치 A/B 두 슬롯이 각각 **바닥과 현재를 따로 보관**하고, 버튼을 누를 때만 기록되므로
+옮기는 동안 이전 기록이 유지된다.
+
+```
+1. 빈 수조에서 위치 A → "A 바닥 기록"
+2. 위치 B로 옮김 (수조는 계속 빈 상태) → "B 바닥 기록"
+3. 물체를 넣음
+4. 위치 B에서 → "B 현재 기록"
+5. 위치 A로 옮김 → "A 현재 기록"
+```
+
+바닥을 **둘 다 먼저** 잡는 것이 핵심이다. 물체를 넣은 뒤에는 바닥을 다시 잡을 수 없다.
+
+#### B-2 baseline 실측 (2026-09-05, 흰 종이 바닥)
+
+두 설치 위치에서 각각 24프레임으로 확보했다. 두 번 모두 무효 zone 0개였다.
+
+| | 위치 1 | 위치 2 |
+|---|---|---|
+| 거리 범위 | 305~495 mm | 305~450 mm |
+| 프레임 간 표준편차 평균 | 3.7 mm | **2.1 mm** |
+| 24장 평균의 표준오차 | 0.75 mm | **0.43 mm** |
+| 열 방향 기울기 | 179 mm | 138 mm |
+| 행 방향 기울기 | — | **1 mm** |
+
+**열 방향으로만 기울고 행 방향은 평평하다.** 센서가 한 축으로만 기운 이상적인
+상태다. 위치 2가 더 가깝고 덜 기울어 노이즈가 절반으로 줄었다.
+
+**검출 가능한 최소 높이**는 단일 프레임 표준편차의 3배 정도로 본다 — 위치 1에서
+약 11 mm, 위치 2에서 약 7 mm.
+
+protocol v2는 WAKE, FRAME, STATUS, CONFIG_SET, CONFIG_ACK, SLEEPING packet을
+구분하고 node ID, sequence, config revision, 시간 telemetry, valid mask, 64개 거리 및
+CRC를 포함한다. SX1262의 한 packet 최대값 255 bytes 안에 유지한다(FRAME 186 byte).
+
+### 0.1.7-a 측정 대상의 반사율 — 검은 바닥은 측정되지 않는다 (2026-09-05)
+
+수조 바닥이 검은 종이일 때 **64 zone 전부가 `----`(무효)** 로 나왔다. 그 위에 흰
+종이를 덮자 **64/64 zone이 즉시 유효**해졌다. 각도도 거리도 그대로였다.
+
+VL53L8CX는 940 nm IR을 쏘고 돌아온 광자를 센다. 검은 무광 표면은 IR을 90% 이상
+흡수해, 50 cm 거리에 비스듬한 입사가 겹치면 신호가 검출 문턱 아래로 떨어진다.
+그때 센서는 status 255(target 미검출)나 1·3·8(신호 부족)을 돌려주고, `valid_mask`
+비트가 서지 않아 `----`로 표시된다.
+
+**`----`의 정확한 정의**: `tof_status_is_valid()`가 ST ULD의 `target_status`를
+5 또는 9일 때만 유효로 본다. 그 외 값은 전부 무효 처리되어 거리값이 가려진다.
+
+| status | 뜻 |
+|---:|---|
+| 0 | 데이터 갱신 안 됨 |
+| 1 | SPAD 배열 신호율 너무 낮음 |
+| 3 | sigma 추정치 너무 큼 |
+| 4 | target consistency 실패 |
+| **5** | **정상** |
+| 8 | 현재 target에 대해 신호율 너무 낮음 |
+| **9** | **정상 (큰 펄스)** |
+| 255 | target 미검출 |
+
+**운용상의 결론**
+
+- **수조 바닥은 밝은 색이어야 한다.** 검은 바닥에서는 baseline 자체를 잡을 수 없다.
+- **어두운 물체는 보이지 않는다.** 시연에 넣을 물체는 밝은 색으로 준비한다. 현재
+  표시로는 "어두워서 안 잡힘"과 "아무것도 없음"이 구분되지 않는다는 한계가 있다.
+- 코드 수정 없이 신호를 늘리는 수단은 **거리 단축**(신호는 거리 제곱에 반비례),
+  **더 수직에 가까운 설치**, **주변 IR 차단**, 그리고 **검은 재질 바꾸기**다. 눈에
+  검다고 940 nm에서도 검은 것은 아니어서, 카본블랙 계열이 아닌 검정은 IR을 잘
+  반사하는 경우가 많다.
+
+**후속 개선안**: 현재는 zone별로 유효/무효 1비트만 전송해 실패 이유를 잃는다. status를
+zone당 4비트로 압축하면 32 byte로 실을 수 있고(FRAME 188 → 220 byte, 255 제한 내),
+UI에서 `----`의 원인을 색으로 구분할 수 있다. 프로토콜 변경이므로 세 보드를 함께
+올려야 한다.
+
+### 0.1.8 B-1/B-2 동시 운용 주의사항
+
+B-1과 B-2는 같은 구간을 보지만 수조의 서로 다른 변에서 마주보며, 위치와 센서 방향이
+다르다. 따라서 두 frame의 같은 zone index를 같은 공간점으로 간주해 바로 평균내면 안
+된다.
+
+- 원본 8×8 matrix는 node ID별로 그대로 보존하고 UI에서 나란히 표시한다.
+- 노드별 설치 transform을 둔다: rotation 0/90/180/270도, mirror X/Y.
+- 실제 설치 후 각 노드의 수면/수조 기준 캘리브레이션을 따로 수행한다.
+- 같은 LoRa channel에서는 B-1/B-2의 동시 송신 충돌을 막기 위해 node별 TX slot 또는
+  deterministic jitter를 적용하고 CONFIG/ACK에도 timeout과 재시도를 둔다.
+- A의 수신 timestamp로 가까운 frame을 묶을 수는 있지만, 정밀 센서 융합에는 별도
+  시간 동기화가 필요하다.
+
+#### 두 위치가 대칭이 아님을 baseline으로 확인했다 (2026-09-06)
+
+같은 센서를 두 위치에서 잡은 baseline으로 정렬을 검증했다. 마주 보는 대칭 배치라면
+한쪽을 180° 돌렸을 때 두 격자가 거의 일치해야 한다.
+
+| 정렬 방식 | 두 baseline의 차이 |
+|---|---|
+| 회전 180° | 평균 **87 mm**, 최대 187 mm |
+| 변환 없음 | 평균 15.6 mm, 최대 45 mm |
+
+**회전 180°가 오히려 더 나쁘다.** 열 기울기도 179 mm와 138 mm로 달라, 두 위치의
+설치 각도가 서로 다르다는 뜻이다. 이 상태로 겹치면 없는 지형을 만들어낸다.
+
+**이 방법 자체가 정렬 도구가 된다.** 두 바닥 기록은 같은 수조 바닥을 본 것이므로,
+올바른 변환을 걸면 서로 일치해야 한다. 마운트를 조정하며 이 차이가 줄어드는지 보면
+자를 대지 않고도 대칭을 맞출 수 있다. 목표는 회전 180° 오차 **20~30 mm 이내**다.
+
+맞춰야 할 것은 두 가지다. **기울기**(열 기울기가 비슷해질 때까지)와 **높이**(근거리
+열 값이 비슷하면 됨 — 307 vs 308로 이미 일치한다).
+
+**두 노드를 합친 3D map은 설치가 확정된 뒤에 붙인다.** Mac UI는 현재 노드별 높이
+맵과 3D 막대 뷰까지만 제공한다. 하나의 수조 좌표계로 합치려면 아래가 실측으로
+정해져야 하며, 그 전에 합치면 숫자를 지어내는 것에 지나지 않는다.
+
+| 필요한 값 | 용도 |
+|---|---|
+| 각 노드의 수조 내 설치 위치 (x, y) | 점군 평행이동 |
+| 각 노드의 바닥 기준 설치 높이 | 높이 원점 |
+| 바라보는 방향 yaw, 기울기 pitch | 점군 회전 |
+| 실제 FoV | zone → 각도 변환 |
+
+`components/geometry`의 `geometry_project_zone()`이 이미 FoV·pitch·roll 기반 투영을
+하므로, 위 값이 정해지면 UI에서 같은 수식으로 두 점군을 공통 좌표계에 올릴 수 있다.
+
+### 0.1.9 전력 감소 시연의 판정 기준
+
+UI의 sleep 상태와 계산된 duty 비율은 동작 설명 자료이지 실제 소비전력 측정값은 아니다.
+전력이 줄었다는 것을 실측으로 보여주려면 B의 배터리 전원 경로에 USB/inline current
+meter 또는 전력 분석기를 넣어 profile 1과 2의 평균 전류를 비교한다. 배터리만 연결한
+상태에서 USB serial이 없어도 A가 수신한 WAKE/SLEEP telemetry로 동작을 확인할 수 있어야
+한다.
+
+**측정과 시연은 반드시 Li-Po 배터리 경로에서 한다.** USB 충전기는 저전력 모드에서
+부하가 낮아지면 출력을 끊어버리므로(0.1.1절), 충전기로는 저전력 동작 자체가
+유지되지 않는다.
+
+더 큰 절감을 위한 후속 선택지는 센서 `VIN`을 Vext로 옮기고 센서 전원을 완전히 끈 뒤
+ESP deep sleep을 사용하는 것이다. 이 변경 전에는 Vext가 VL53L8CX peak 약 150 mA와
+LoRa 송신 부하를 안정적으로 공급하는지 검증해야 한다. `LP` LOW는 I2C 비활성화이지
+carrier 전원 차단이 아니다.
+
+### 0.1.10 다음 작업 순서와 완료 조건
+
+| # | 단계 | 상태 |
+|---:|---|---|
+| 1 | **ToF 검출 복구** — 원인 규명 및 B-1/B-2 8×8 확인 | ✅ 완료 |
+| 2 | **protocol v2 구현** — packet 6종, 시간 telemetry, 호스트 테스트 | ✅ 완료 |
+| 3 | **헤더 납땜** — B-1/B-2 Pololu carrier 고정 | ✅ 완료 |
+| 4 | **v2 펌웨어 업로드** — 세 보드 전부 | ✅ 완료 |
+| 5 | **B 저전력 sender** — VL53L8CX SLEEP/WAKEUP, SX1262 warm sleep, ESP light sleep, 설정 적용 state machine | ✅ **실기 검증 완료** |
+| 6 | **A bridge** — 설정 queue/downlink, ACK/retry, serial command와 event | ✅ **실기 검증 완료** |
+| 7 | **Mac 로컬 UI** — 노드 카드, matrix, preset/custom, baseline, 높이 표시 | ✅ 구현 완료 (B-2 표시 확인) |
+| 8 | **B-1 센서 교체** — Pololu #3419 carrier 신품 | ⬜ **현재 최우선.** 보드·배선은 정상 확인됨 |
+| 9 | **배터리 독립 운용** — B-2 배터리만으로 정상 동작 | ✅ 완료 |
+| 10 | **두 노드 통합 시험** — 충돌 회피(TX slot 연결), 개별/동시 설정, 방향 transform | ⬜ 8·9 이후 |
+| 11 | **설치 실측 + 합친 3D map** — 노드 위치·각도·높이 확정 후 UI에 반영 | ⬜ |
+| 12 | **baseline 캘리브레이션** — 빈 수조 기준면 확보, `HEIGHT_DEMO`의 1000 mm 상수 제거 | ⬜ |
+| 13 | **수조 시연 리허설** — profile 1 약 70초, profile 2 약 60초, inline meter 병행 | ⬜ |
+
+각 단계의 gate는 다음과 같다.
+
+- 플래시 전에는 항상 `read_mac`으로 대상 보드를 확인한다. 포트 이름은 신원이 아니다.
+- **플래시·모니터 전에는 배터리를 분리한다.** 배터리가 붙어 있으면 USB가 열거되지
+  않는다.
+- **B 노드의 부팅 기본값은 `sleep_s=0`을 유지한다.** 카트리지 안에서 멈췄을 때
+  전원 재투입만으로 항상 도달 가능한 상태로 돌아오게 하는 안전장치다.
+- 프로파일 변경은 재플래시가 아니라 **A의 `CFG` 명령으로 한다.** 카트리지를 열
+  이유를 만들지 않는다.
+- B-1과 B-2는 서로 다른 고정 node ID를 사용한다.
+- **저전력 시험과 전력 측정은 배터리 경로에서만 한다.** 충전기는 저부하에서 출력을
+  끊는다.
+- 실제 전력 감소 주장은 inline meter 측정값으로 판단한다.
+
+### 0.1.11 아직 확인하지 못한 항목
+
+| 항목 | 필요한 이유 |
+|---|---|
+| ~~배터리 구동~~ | **해결됨.** 송신 출력이 원인이었다(아래 참조) |
+| **Pololu #3419 carrier 신품** | B-1 센서 교체용. **현재 최대 블로커** |
+| 세 보드의 PCB revision (`V3.0`/`V3.1`/`V3.2`) | Vext 공급 능력, 배터리 전압 ADC 핀 확인 |
+| inline current meter 또는 전력 분석기 | 13단계 및 0.1.9절 판정 기준. **없으면 전력 감소를 주장할 수 없다** |
+| 수조 실물과 노드 설치 위치·각도·높이 | 11·12단계 (합친 3D map, baseline) |
+| 멀티미터 | 배터리 전압 확인 |
+
+#### 배터리 구동 실패의 원인 — LoRa 송신 출력 (2026-09-03, 해결)
+
+3.7 V / 2500 mAh 셀만으로는 B 노드가 부팅하지 않고 A에 아무 패킷도 도착하지
+않았다. **원인은 배터리가 아니라 우리 펌웨어의 LoRa 송신 출력이었다.**
+
+가설을 세 번 잘못 세웠으므로 배제 과정을 남긴다.
+
+| 관찰 | 배제된 가설 |
+|---|---|
+| 동료의 Arduino 펌웨어가 **배터리만으로** 8×8과 LoRa 송신까지 수행 | 극성 반대, 셀 불량, 방전 |
+| 외부 USB 전원에서는 즉시 정상 동작 | 보드·배선·무선 경로 |
+| 배터리 + 충전기 동시 연결 시 정상 동작 | 셀 사망, 보호회로 차단 |
+| **송신 출력을 10 → 5 dBm으로 낮추자 배터리만으로 정상 동작** | — 원인 확정 |
+
+Arduino 스케치와 우리 펌웨어를 비교해 찾은 차이는 다음과 같다.
+
+| 항목 | Arduino | 우리 (수정 전) |
+|---|---|---|
+| **LoRa 송신 출력** | **5 dBm** | **10 dBm** |
+| 첫 송신 시점 | `setup()` 완료 후 `loop()` | **부팅 직후 BOOT status** |
+| 송신 후 radio | `Radio.Sleep()` | 계속 RX 대기 |
+| ranging | 연속 5 Hz | cycle마다 start/stop, 10 Hz |
+| I2C | 100 kHz | 400 kHz |
+| Vext(GPIO36) | 건드리지 않음 | LOW로 구동 |
+
+10 dBm은 5 dBm의 약 3배 전력이고 송신 순간 소비전류가 크게 늘어난다. 게다가 우리는
+**전원이 막 안정화되는 부팅 직후에** 그 송신을 했다. 전압이 주저앉으면 브라운아웃
+리셋 → 재부팅 → 다시 송신 시도가 반복되는데, **패킷이 완성되지 못하므로 A에는
+아무것도 보이지 않는다.** 관측된 "완전 무음"과 정확히 일치한다.
+
+**조치 (`components/lora_radio/include/lora_radio.h`, `main/sender_lowpower.c`)**
+
+- `LORA_RADIO_TX_POWER_DBM`을 **10 → 5**로 낮췄다. 측정 RSSI가 −14~−27 dBm이고
+  수신 한계는 −120 dBm 근처이므로 90 dB 이상 여유가 있다. 5 dB를 포기해도 링크에
+  영향이 없고, 보드를 가까이 둘 때의 수신기 포화도 완화된다.
+- 부팅 후 첫 송신 전에 **500 ms 안정화 지연**을 넣었다.
+
+**교훈**: B 노드가 배터리에서 조용할 때 배터리부터 의심하기 쉽지만, 같은 하드웨어가
+다른 펌웨어에서 동작한다면 **원인은 펌웨어 쪽에 있다.** 동작하는 참조 구현이 있으면
+설정값을 항목별로 대조하는 것이 가장 빠르다.
+
+#### 아직 대조하지 않은 차이
+
+배터리 지속시간이 부족하면 다음을 검토한다.
+
+- **`useRegulatorLDO=true`** — `LoRaBegin()`의 마지막 인자. SX1262를 LDO 모드로
+  돌리며 DC-DC 모드보다 소비전류가 크다. 보드에 DC-DC용 인덕터가 있는지 확인 후 변경.
+- **상시 RX 대기** — 우리 sender는 `CONFIG_SET` 수신을 위해 wake window 동안 라디오를
+  RX에 둔다(약 5 mA 상시). Arduino는 송신 후 곧바로 `Radio.Sleep()`한다. 무선 설정
+  변경 기능과의 맞바꿈이므로 없앨 수는 없다.
+- **Vext(GPIO36) 구동** — `VIN`이 고정 `3V3`이면 우리 쪽은 아무 쓸모 없이 켜는 셈이다.
+
+#### 후속 제안: 배터리 전압 telemetry
+
+카트리지가 봉인되면 배터리 상태를 확인할 방법이 없다. Heltec V3의 배터리 전압을
+ADC로 읽어 telemetry에 실으면 A와 UI에서 원격으로 볼 수 있고, 브라운아웃 직전 경고와
+0.1.9절 전력 시연 자료로도 쓸 수 있다.
+
+다만 공통 헤더 48 byte가 빈틈 없이 차 있어 필드를 추가하면 **모든 packet 크기가
+바뀌고 wire 호환이 깨진다.** 세 보드를 동시에 다시 올려야 하므로, **B-1 복구 시점에
+함께 처리한다.** ADC 핀이 보드 revision에 따라 다를 수 있으므로 그 전에 실크로
+revision을 확인해 둔다.
+| KR920 채널/출력/airtime 규정 | 3.4절. 현재 922.1 MHz / 5 dBm은 대역 안에 있으나 최종 확인 필요 |
+
+---
+
+## 1. 결론
+
+### 1.1 권장 개발 방식
+
+**Arduino 확장이 아니라 ESP-IDF를 사용한다.** 정확한 기준 버전은 현재 프로젝트가
+실제로 빌드된 **ESP-IDF v5.4.4**이며, 타깃은 **ESP32-S3**다.
+
+근거는 다음과 같다.
+
+- 이 폴더는 이미 ESP-IDF의 CMake/component/Kconfig 구조로 작성되어 있다.
+- `build/project_description.json`에 ESP-IDF `v5.4.4`, 타깃 `esp32s3`, 산출물
+  `tof_height.bin`이 기록되어 있다.
+- ToF 드라이버가 ESP-IDF 5.4 이상의 새 I2C master API와 FreeRTOS,
+  `esp_timer`, Kconfig를 직접 사용한다.
+- `rjrp44/vl53l8cx` ESP Component Registry 의존성이 이미 연결되어 있다.
+- LoRa, 장시간 운용, 오류 처리, 추후 NVS/OTA 같은 기능은 ESP-IDF가 더 직접적이고
+  유지보수하기 쉽다.
+
+Arduino IDE/확장은 배선 확인용 최소 예제를 빠르게 돌릴 때는 편하지만, 이 코드를
+Arduino 프로젝트로 옮기려면 빌드 구조와 드라이버 계층을 다시 작성해야 한다.
+동료가 Arduino 확장으로 하드웨어 동작만 확인한 결과는 **하드웨어가 살아 있다는
+참고 자료**로 사용하고, 본 프로젝트의 기준 툴체인으로 사용하지 않는다.
+
+### 1.2 현재 완성도
+
+현재 소스는 LoRa baseline까지 구현·빌드됐지만, 최종 2-node 저전력/UI 시스템은 아직
+완성되지 않았다. 정확한 최신 상태는 0.1절을 기준으로 하며 요약은 다음과 같다.
+
+| 기능 | 현재 상태 | 비고 |
+|---|---|---|
+| ESP32-S3 빌드 | 확인됨 | diagnostic/sender/receiver/i2cdiag 4개 역할 생성 |
+| 보드/센서 제품군 | 확인됨 | Heltec WiFi LoRa 32 + Pololu VL53L8CX carrier #3419 |
+| VL53L8CX 초기화/측정 | **B-2 정상, B-1 수리 중** | B-2 `valid=64/64`, `retries=0` |
+| 8×8 거리 출력 | 확인됨 | USB serial 및 LoRa 무선 양쪽으로 확인 |
+| zone별 상태·신호 전체 CSV | 부분 구현 | 출력 함수는 있으나 현재 실행 경로에서 호출하지 않음 |
+| 물 표면/반사 특성 실험 | 구현됨 | specular, water-level, repeatability 모드 |
+| 높이 계산 데모 | 부분 구현 | 실제 캘리브레이션 대신 1000 mm 고정 기준값 사용 |
+| B 노드 2대 | B-2 정상, **B-1 센서 교체 대기** | `node_id` 1/2 구분은 확인됨 |
+| LoRa 송수신 | **실기 검증 완료** | A↔B-1, A↔B-2 8×8 프레임, RSSI/SNR 확인 |
+| protocol v2 | 구현·업로드·실기 검증 완료 | 6종 packet, 64-bit 누적시간, CONFIG/ACK |
+| I2C 진단 도구 | 구현됨 | `i2cdiag` 역할. 멀티미터 없이 접점/전원/센서 ID 판별 |
+| profile 1/2 sleep 주기 | **실기 검증 완료** | `last_sleep` 24999 / 9999 ms 실측 |
+| A 설정 bridge | **실기 검증 완료** | `main/bridge.c`; queue·downlink·ACK·재부팅 자동 복구 |
+| Mac 로컬 UI | **구현 완료** | `tools/ui/`; 실시간 페이지 + `/survey` 위치 스캔. B-2로 baseline·높이까지 확인 |
+| 배터리 독립 운용 | **B-2 확인 완료** | 송신 출력 5 dBm으로 해결(0.1.11절) |
+| 두 노드 합친 3D map | 미구현 | 설치 위치·각도 실측 필요(0.1.8절) |
+| NVS 캘리브레이션 | 미구현 | 재부팅 후 기준면 복원 기능 없음 |
+| 호스트 단위 테스트 | 구현됨 | geometry/height/pipeline/lora_protocol 4개 통과 |
+
+---
+
+## 2. 폴더 및 파일 역할
+
+### 2.1 옮겨야 하는 프로젝트 핵심
+
+```text
+ToF/
+├── CMakeLists.txt                 ESP-IDF 최상위 프로젝트, 이름 tof_height
+├── sdkconfig.defaults             esp32s3 및 main task stack 8192 기본값
+├── sdkconfig                      현재 전체 설정 스냅샷
+├── dependencies.lock              IDF 5.4.4, vl53l8cx 4.0.1 잠금 정보
+├── main/
+│   ├── main.c                     diagnostic/sender/receiver 역할 실행
+│   ├── bridge.c/.h                A 역할: 수신, JSON 이벤트, 설정 queue/downlink
+│   ├── sender_lowpower.c/.h       B 역할: 저전력 cycle, 설정 수신·ACK
+│   ├── i2c_diag.c/.h              i2cdiag 역할: 접점·전원·센서 ID 진단, hold test
+│   ├── app_config.h               현재 I2C GPIO와 센서 자세 placeholder
+│   ├── Kconfig.projbuild          menuconfig의 실행 모드/실험 파라미터
+│   ├── CMakeLists.txt             main이 사용할 컴포넌트 선언
+│   └── idf_component.yml          rjrp44/vl53l8cx 의존성 선언
+├── components/
+│   ├── tof_driver/                VL53L8CX 초기화, I2C, 프레임 수집
+│   ├── single_sensor_test/         CSV/반사/수위/반복성 실험 모드
+│   ├── geometry/                   좌표 변환 및 높이 계산, 순수 C
+│   ├── telemetry/                  USB 콘솔용 JSON/CSV 출력
+│   ├── lora_radio/                 SX1262 상위 wrapper
+│   └── lora_protocol/              node/status/8×8 binary packet 및 CRC16
+├── external/
+│   └── esp-idf-sx126x/             외부 SX1262/RA-01S ESP-IDF driver
+├── tools/ui/
+│   ├── server.py                  시리얼 브리지 + HTTP (표준 라이브러리 + PySerial)
+│   ├── index.html                 실시간 모니터, 8×8, 연속 곡면, 수조 막대 뷰
+│   ├── survey.html                한 센서를 두 위치로 옮겨 스캔 (`/survey`)
+│   └── ui_state.json              baseline·방향 설정 (git 제외)
+├── test/host/                     Mac에서 보드 없이 돌리는 CMake 테스트
+├── build_diag/                    Mac diagnostic 역할 산출물
+├── build_b1/                      Mac sender/node 1 역할 산출물
+├── build_a/                       Mac receiver 역할 산출물
+└── docs/                          제어 알고리즘 및 보고서 초안
+```
+
+위 항목은 모두 Mac으로 옮긴다. `README.md`도 함께 보관한다.
+
+### 2.2 자동 재생성하거나 선택적으로 옮길 항목
+
+| 경로 | 역할 | Mac 이전 판단 |
+|---|---|---|
+| `managed_components/` | Registry에서 내려받은 VL53L8CX 4.0.1 소스 | 보통 제외. `idf.py reconfigure`가 재생성 |
+| `STSW-IMG040/` | 별도로 받은 ST 공식 VL53L8CX ULD 원본이 있을 때 | 참고자료로만 선택 이전, 현재 빌드에는 불필요 |
+| `build/` | Windows ESP-IDF 산출물 약 129 MiB | **제외 필수**. Windows 절대 경로와 `.exe` 포함 |
+| `build_host/` | Windows 호스트 테스트 산출물 | **제외 필수**. Mac에서 다시 생성 |
+| `.vscode/` | Windows 전용 IDF 경로와 PowerShell 스크립트 | 그대로 사용 금지. 제외하거나 Mac에서 재설정 |
+| `ToF.code-workspace` | Windows의 다른 두 폴더까지 참조하는 workspace | 제외 권장. Mac에서는 `ToF` 폴더만 열기 |
+
+`sdkconfig`는 플랫폼 독립 설정이 대부분이므로 보관할 수 있지만, 첫 Mac 설정에서는
+`sdkconfig.defaults`와 Kconfig를 기준으로 새로 생성하는 방법을 권장한다. 기존
+`sdkconfig`는 비교용으로 `sdkconfig.windows.backup` 같은 이름으로 보관해도 된다.
+
+### 2.3 현재 코드의 실행 흐름
+
+```text
+app_main
+  ├─ APP_NODE_ROLE=diagnostic
+  │    └─ 기존 실험 mode → ToF init/ranging → USB CSV/JSON
+  ├─ APP_NODE_ROLE=sender, APP_NODE_ID=1 또는 2   (sender_lowpower.c)
+  │    └─ 저전력 cycle: WAKE → 설정 수신/ACK → 측정 → frame TX
+  │       → 센서 SLEEP → radio warm sleep → ESP light sleep
+  ├─ APP_NODE_ROLE=receiver                      (bridge.c)
+  │    └─ RX → decode → 사람 로그 + JSON 이벤트
+  │       ← serial 명령(CFG/STATUS/MODE) → 설정 queue → CONFIG_SET
+  └─ APP_NODE_ROLE=i2cdiag
+       └─ 유휴 라인 레벨 → Vext OFF/ON 각각 버스 스캔과 device ID 조회
+          → hold test(무한 재시도 + 연속 8×8)
+```
+
+역할은 CMake cache의 `APP_NODE_ROLE=diagnostic|sender|receiver|i2cdiag`로 선택하고
+sender는 `APP_NODE_ID`를 별도로 지정한다. diagnostic 내부의 기본 실험 모드는
+`SST_CSV`다.
+
+`i2cdiag`는 배선 문제 진단 전용이며 SX1262를 초기화하지 않는다(송신 없음, 안테나
+불필요). `main/i2c_diag.c`에 독립적으로 구현되어 있고 다른 세 역할의 코드는 이
+빌드에서 컴파일되지 않는다. hold test는 `tof_init`을 성공할 때까지 무한 재시도하고
+I2C를 100 kHz로 낮춰 접촉이 불안정한 하네스에서도 프레임을 얻을 수 있게 한다.
+빌드 예:
+
+```bash
+idf.py -B build_i2cdiag -DSDKCONFIG=sdkconfig.i2cdiag \
+       -DAPP_NODE_ROLE=i2cdiag build
+```
+현재 sender의 10초 간격은 `vTaskDelay`이므로 저전력 sleep으로 해석하면 안 된다.
+`HEIGHT_DEMO`는 별도 diagnostic mode이며 기준면을 실제로 측정하지 않고 모든 zone을
+`1000 mm`로 가정한다.
+
+---
+
+## 3. 하드웨어 기준과 확인할 정보
+
+### 3.1 구매 내역으로 확인된 하드웨어
+
+2026-08-15에 제공된 영수증 이미지로 다음 제품을 확인했다.
+
+#### ESP/LoRa 보드
+
+- 제품군: **Heltec WiFi LoRa 32**
+- MCU: ESP32-S3 계열
+- 내장 radio: **Semtech SX1262**
+- 구매 대역 표기: **863–928 MHz**
+- USB: Type-C, V3 계열은 CP2102 USB-UART 내장
+- 디스플레이: 0.96인치 128×64 OLED 내장
+- 전원: USB 또는 3.7 V Li-Po, 외부 장치용 3.3 V `Vext` 제공
+
+ESP32-S3 + SX1262 조합은 Heltec 공식 분류상 **WiFi LoRa 32 V3 계열**과 일치한다.
+단, 영수증에는 PCB의 `V3.0`, `V3.1`, `V3.2`가 표시되지 않으므로 정확한 revision은
+보드 앞·뒷면 실크로 확인해야 한다. V3.1부터 USB-C to C 지원이 추가됐으므로 해당
+revision 확인은 macOS USB 연결 문제 진단에도 필요하다.
+
+#### ToF 센서 보드
+
+- 제조사/제품: **Pololu VL53L8CX Time-of-Flight 8×8-Zone Distance Sensor Carrier
+  with Voltage Regulators, 400cm Max**
+- Pololu item number: **#3419**
+- 센서 IC: STMicroelectronics VL53L8CX
+- 측정: 4×4 또는 8×8 zone, 최대 명목 거리 4 m, 940 nm Class 1 VCSEL
+- carrier `VIN`: **3.2–5.5 V**
+- carrier에 3.3 V/1.8 V regulator와 logic level shifter 내장
+- active ranging 전류: typical 약 100 mA, 조건에 따라 peak 약 150 mA
+- I2C 주소: 7-bit `0x29` (`0x52`를 8-bit 표기로 쓰는 문서도 있음)
+- `SPI/I2C` 핀: carrier 기본 pull-up은 SPI 선택이므로 **I2C 사용 시 GND로 LOW 고정**
+- `LP` 핀: active-low I2C disable, carrier에서 기본 HIGH pull-up
+
+영수증의 400핀 half-size breadboard는 프로토타이핑 부품이며 펌웨어 모델에는 영향을
+주지 않는다.
+
+### 3.2 현재 코드와 권장 I2C 배선
+
+현재 펌웨어는 다음을 가정한다.
+
+- 센서: VL53L8CX 1개
+- SDA: GPIO 41
+- SCL: GPIO 42
+- I2C: 1 MHz
+- 센서 주소: 7-bit `0x29`
+- 센서 LP/전원 제어 GPIO: 아직 없음
+- 콘솔: 115200 baud, UART primary + USB Serial/JTAG secondary
+
+2026-08-15 배선 담당자의 회신으로 현재 몸체의 실제 연결을 다음과 같이 확인했다.
+
+| Pololu #3419 | Heltec WiFi LoRa 32 | 비고 |
+|---|---|---|
+| `VIN` | 고정 `3V3` | 확인됨. 현재 GPIO로 전원 차단 불가 |
+| `GND` | `GND` | 확인됨 |
+| `SDA/MOSI` | GPIO 41 | 확인됨. 현재 코드와 일치 |
+| `SCL/MCLK` | GPIO 42 | 확인됨. 현재 코드와 일치 |
+| `SPI/I2C` | `GND` | 확인됨. I2C mode 선택 |
+| `LP` | 회신에 별도 연결 없음 | **기능으로 확인됨.** LOW면 I2C가 죽는데 8×8이 나왔으므로 HIGH다 |
+| `INT`, `SYNC` | 사용하지 않음 | 현재 polling 방식에는 불필요. 납땜 대상에서 제외 |
+
+2026-08-28 기준 위 배선은 **구성 자체가 옳다는 것이 실기로 증명됐다.** `SPI/I2C`가
+LOW(I2C 모드)이고 `LP`가 HIGH가 아니었다면 `vl53l8cx_is_alive()`가 `0xF0`/`0x0C`를
+돌려줄 수 없다. 남은 문제는 배선 구성이 아니라 **헤더가 납땜되지 않아 접점이
+간헐적이라는 것**뿐이다(0.1.3절).
+
+Pololu carrier에는 regulator, level shifter 및 pull-up이 이미 포함되어 있으므로 bare
+VL53L8CX용 1.8 V 배선이나 별도 2.2 kΩ pull-up 지침을 그대로 적용하지 않는다.
+Pololu는 level shifter 안정성을 위해 통신선을 가능하면 **8 cm 이하**로 유지하고 같은
+버스에 장치를 많이 연결하지 않도록 권고한다.
+
+### 3.3 Vext와 전원 차단 기준
+
+Heltec V3 계열의 `Vext`는 외부 센서용 3.3 V 출력이며 GPIO36으로 제어한다. Heltec
+공식 예제의 논리는 다음과 같다.
+
+- GPIO36 LOW: `Vext` ON
+- GPIO36 HIGH: `Vext` OFF
+- boot 직후 기본 상태: OFF로 취급하고 명시적으로 ON 설정
+
+현재 배선은 Pololu `VIN`이 고정 `3V3`에 연결되어 있으므로 ESP가 deep sleep에
+들어가도 sensor carrier에는 계속 전원이 공급된다. 따라서 현재 배선을 유지하려면
+반드시 ranging 중지와 VL53L8CX power-mode 전환을 소프트웨어로 수행해야 한다.
+
+향후 Pololu #3419의 `VIN`을 `Vext`로 변경하면 ESP가 sensor IC의 내부 sleep mode를
+호출하지 않아도 carrier 전체 전원을 끌 수 있다. 이 경우 VL53L8CX의 firmware와
+configuration은 사라지므로 다음 wake에서 `tof_init()` 전체 과정을 다시 실행한다.
+
+`LP`를 LOW로 하는 것은 I2C 통신을 비활성화하는 기능이지 carrier 전원을 끄는 기능이
+아니다. 저전력 전원 차단 용도로 `LP`만 사용하지 않는다.
+
+### 3.4 전원 및 RF 안전 규칙
+
+- Pololu carrier의 `VIN`에는 3.2–5.5 V만 공급한다.
+- `VIN=3.3 V`이면 carrier I/O도 3.3 V로 level shifting되므로 ESP32-S3와 호환된다.
+- 센서 보호 liner가 남아 있으면 측정 전에 제거한다.
+- LoRa 송신 전 반드시 863–928 MHz용 안테나를 연결한다.
+- 구매 대역이 넓더라도 실제 채널과 출력은 한국에서 사용할 방식(KR920/허용 규정)에
+  맞춰 별도로 확정한다.
+- 센서 peak 전류와 LoRa TX가 겹칠 때 전압 강하/재부팅이 없는지 측정한다.
+
+### 3.5 아직 확인할 사항
+
+1. 세 보드 실크의 정확한 revision (`V3.0`, `V3.1`, `V3.2`) — 유일하게 남은 하드웨어
+   미확인 항목이다
+2. ~~Pololu `LP` 상태~~ — 0x29 응답으로 HIGH임이 확인됐다
+3. ~~Arduino 확인 자료~~ — ESP-IDF 펌웨어로 직접 8×8을 확인했으므로 더 이상 필요없다
+4. ~~최종 LoRa 방식~~ — **point-to-point로 확정.** 922.1 MHz 자체 protocol로 A↔B
+   양방향을 구성한다. LoRaWAN은 게이트웨이/네트워크 서버/키 관리가 추가되어 본
+   시연 범위를 벗어난다
+
+---
+
+## 4. Mac으로 옮길 파일 묶음
+
+권장 이전 대상은 아래와 같다.
+
+```text
+CMakeLists.txt
+sdkconfig.defaults
+dependencies.lock
+README.md
+SPEC.md
+main/
+components/
+test/
+docs/
+```
+
+`sdkconfig`와 별도로 보관 중인 `STSW-IMG040/`은 선택 사항이다. 아래는 옮기지 않는다.
+
+```text
+build/
+build_host/
+managed_components/
+.vscode/
+ToF.code-workspace
+```
+
+가능하면 Git 저장소를 만들어 전송한다. Git을 사용하지 않으면 위 목록만 ZIP으로
+묶되, macOS에서 압축을 푼 경로에는 공백이나 한글을 피한다. 예:
+
+```text
+~/Projects/ToF
+```
+
+비밀키나 LoRaWAN AppKey/NwkKey는 소스와 ZIP에 넣지 않는다. 추후 키 저장 방식을
+별도로 정한다.
+
+---
+
+## 5. 빈 MacBook에서 개발 환경 설치
+
+### 5.1 준비물
+
+- 데이터 전송이 가능한 USB 케이블
+- VS Code
+- 인터넷 연결: ESP-IDF 도구와 managed component 최초 다운로드에 필요
+- Apple Silicon 또는 Intel Mac 모두 가능
+
+### 5.2 권장 설치 경로: VS Code + Espressif 공식 확장
+
+1. VS Code를 설치한다.
+2. Extensions에서 **Espressif IDF** (`espressif.esp-idf-extension`)를 설치한다.
+3. Command Palette(`Shift + Command + P`)에서
+   `ESP-IDF: Open ESP-IDF Installation Manager`를 실행한다.
+4. Custom/Expert installation에서 **ESP-IDF v5.4.4**를 선택하고 설치한다.
+   최신 6.x로 자동 업그레이드하지 않는다.
+5. Command Palette에서 `ESP-IDF: Select Current ESP-IDF Version`을 실행하고
+   방금 설치한 v5.4.4를 선택한다.
+6. `ESP-IDF: Doctor Command`를 실행해 오류가 없는지 확인한다.
+
+공식 설치 안내:
+
+- https://docs.espressif.com/projects/vscode-esp-idf-extension/en/latest/installation.html
+- https://docs.espressif.com/projects/esp-idf/en/v5.4.4/esp32s3/get-started/linux-macos-setup.html
+
+### 5.3 v5.4.4가 Installation Manager에 보이지 않을 때
+
+Terminal에서 legacy 방식으로 정확한 태그를 설치한다.
+
+```bash
+xcode-select --install
+
+mkdir -p ~/esp
+cd ~/esp
+git clone -b v5.4.4 --recursive https://github.com/espressif/esp-idf.git
+cd ~/esp/esp-idf
+./install.sh esp32s3
+```
+
+프로젝트 작업을 시작할 때마다 같은 Terminal에서 환경을 활성화한다.
+
+```bash
+. ~/esp/esp-idf/export.sh
+```
+
+VS Code에서는 설치된 v5.4.4 경로를 현재 ESP-IDF 버전으로 선택한다. Windows의
+`.vscode/settings.json`에 있는 `C:\esp\v5.4.4\esp-idf` 경로는 사용하지 않는다.
+
+---
+
+## 6. Mac에서 프로젝트 최초 구성 및 보드 없는 검증
+
+### 6.1 프로젝트 열기
+
+VS Code에서 `File > Open Folder...`로 `~/Projects/ToF` 하나만 연다.
+기존 `ToF.code-workspace`는 Windows의 다른 작업 폴더를 참조하므로 열지 않는다.
+
+VS Code의 ESP-IDF terminal을 열거나 일반 Terminal에서 v5.4.4 환경을 활성화한 뒤:
+
+```bash
+cd ~/Projects/ToF
+idf.py --version
+```
+
+출력은 `ESP-IDF v5.4.4`여야 한다.
+
+### 6.2 Windows 산출물 제거 및 재구성
+
+Mac으로 잘못 복사된 `build/`, `build_host/`, `managed_components/`가 있다면 먼저
+프로젝트 밖에 백업한 뒤 제거한다. 그 다음:
+
+```bash
+cd ~/Projects/ToF
+idf.py set-target esp32s3
+idf.py reconfigure
+idf.py build
+```
+
+`reconfigure` 시 `rjrp44/vl53l8cx`가 Registry에서 내려받아지고
+`managed_components/rjrp44__vl53l8cx/`가 새로 생겨야 한다. 의존성 기준은:
+
+- ESP-IDF: 5.4.4
+- `rjrp44/vl53l8cx`: 4.0.1 (`dependencies.lock` 기준)
+
+성공 기준:
+
+- `build/tof_height.bin`
+- `build/tof_height.elf`
+- `Project build complete` 메시지
+
+### 6.3 Mac 호스트 단위 테스트
+
+Apple Clang과 CMake로 보드 없이 순수 계산 로직을 검증한다.
+
+```bash
+cd ~/Projects/ToF
+cmake -S test/host -B build_host
+cmake --build build_host
+ctest --test-dir build_host --output-on-failure
+```
+
+성공 기준은 아래 4개가 모두 통과하는 것이다.
+
+- `test_geometry`
+- `test_height_est`
+- `test_pipeline`
+- `test_lora_protocol`
+
+---
+
+## 7. ToF 센서 1개 최초 실행
+
+### 7.1 플래시 전 설정
+
+1. 실제 배선과 `main/app_config.h`의 `TOF_PIN_SDA=41`, `TOF_PIN_SCL=42`를
+   대조한다.
+2. Pololu #3419의 `SPI/I2C`가 GND이고 `LP`가 HIGH인지 확인한다.
+3. 현재 확인된 대로 센서 `VIN`이 고정 `3V3`에 연결되어 있는지 확인한다. 이 배선은
+   ESP deep sleep 중에도 센서에 전원을 계속 공급한다.
+4. 아래 명령으로 menuconfig를 연다.
+
+```bash
+idf.py menuconfig
+```
+
+`ToF Height Estimation > Application run mode`에서 우선
+**Single-sensor: 8x8 distance logger**를 선택한다. 저장 후 종료한다.
+
+### 7.2 macOS serial port 찾기
+
+보드를 뺀 상태와 꽂은 상태에서 각각 실행한다.
+
+```bash
+ls /dev/cu.*
+```
+
+새로 생긴 포트가 보드 포트다. 예:
+
+```text
+/dev/cu.usbserial-1401
+/dev/cu.usbmodem1101
+```
+
+포트가 생기지 않으면 먼저 충전 전용 케이블 여부를 확인하고 CP2102용 macOS
+driver를 확인한다. USB-C to C 연결이라면 보드 revision도 확인한다. Heltec 공식
+변경 이력상 C-to-C 지원은 V3.1부터 추가됐다.
+
+### 7.3 빌드, 플래시, 모니터
+
+```bash
+cd ~/Projects/ToF
+idf.py build
+idf.py -p /dev/cu.usbmodemXXXX flash monitor
+```
+
+모니터 종료는 `Ctrl + ]`이다. 자동 다운로드에 실패하면 보드의 BOOT 버튼을 누른
+상태에서 RESET을 한 번 누르고 BOOT을 놓은 뒤 다시 flash한다.
+
+첫 성공 로그에는 다음이 포함되어야 한다.
+
+```text
+tof_height: skeleton boot OK (target=esp32s3)
+SST: 8x8 logger start: one frame every 5000 ms
+TOF8X8 sensor=0 t_us=... frame=... distance_mm
+R0 | ...
+...
+valid_zones=.../64
+```
+
+각 출력마다 8행×8열 거리 matrix가 나와야 한다. 물체를 센서 앞에서 움직였을 때
+거리값이 바뀌고 `valid_zones`가 안정적으로 유지되면 1차 bring-up 성공이다. zone별
+`status`, `valid`, `signal_per_spad` 전체 CSV는 출력 함수는 존재하지만 현재 기본
+실행 경로에는 연결되어 있지 않으므로 필요 시 코드 수정이 필요하다.
+
+### 7.4 실패 시 진단 순서
+
+| 증상 | 우선 확인 |
+|---|---|
+| serial port 없음 | 데이터 케이블, 다른 USB 포트, USB-UART driver |
+| flash 연결 실패 | 올바른 `/dev/cu.*`, 다른 monitor 종료, BOOT/RESET 진입 |
+| `tof_init failed` | SDA/SCL, GND, 고정 3V3 VIN, `SPI/I2C=LOW`, LP HIGH 여부 |
+| `tof_start_ranging failed` | 센서 초기화 로그, 전원 안정성, ULD 버전 |
+| `tof_get_frame failed` | I2C 신호, 가능하면 8 cm 이하 배선, 센서 응답 |
+| 거리값이 0/invalid 위주 | 측정 범위, 표면 반사, 렌즈 보호필름, 오염 |
+| 글자가 깨짐 | monitor 115200 baud, 올바른 포트 |
+
+---
+
+## 8. 현재 제공되는 실험 모드
+
+`idf.py menuconfig`의 `ToF Height Estimation` 메뉴에서 하나를 선택한다.
+
+| 모드 | 용도 | 현재 주의점 |
+|---|---|---|
+| `SST_CSV` | 8×8 거리 matrix 확인 | **첫 실행 권장**, 이름과 달리 현재 전체 CSV는 아님 |
+| `SST_REPEAT` | zone별 평균과 표준편차 | 정지된 표면에서 사용 |
+| `SST_SPECULAR` | 중심/주변 `signal_per_spad` 비율 확인 | 분류기/정반사도 아님, 60° 설치에서는 기하 보정 필요 |
+| `SST_WATER` | 중심 12 zone 중 최대 신호 거리로 수위 계산 | 센서 설치 높이를 실제 mm로 설정 |
+| `HEIGHT_DEMO` | zone별 높이 JSON 출력 | 기준거리 1000 mm placeholder, 제품값으로 사용 금지 |
+
+권장 검증 순서는 `SST_CSV → SST_REPEAT → SST_SPECULAR → SST_WATER`다.
+
+---
+
+## 9. 주기 측정과 저전력 동작 설계
+
+### 9.1 목표 주기
+
+최신 목표는 0.1.5절의 두 runtime profile이다. 최초 설계의 고정 60초 sleep안은 더
+이상 최종 요구사항이 아니다.
+
+```text
+wake
+  → 설정 downlink 수신/ACK
+  → 센서 WAKEUP 및 ranging 시작
+  → 10초 wake window 안에 1회 측정(실패 시 총 3회까지 시도)
+  → 8×8 frame 저장/송신
+  → ranging 중지
+  → 센서 SLEEP → SX1262 warm sleep
+  → ESP32-S3 timer light sleep 25초 또는 10초
+  → 반복
+```
+
+profile 1은 25초 sleep + 10초 wake, profile 2는 10초 sleep + 10초 wake다. wake는
+측정 후 추가 대기가 아니라 cycle 전체의 활성 window다. ESP-IDF timer wakeup과 light
+sleep을 사용하고, 측정/통신에 쓴 시간을 포함해 설정된 window 종료 시각을 계산한다.
+
+### 9.2 ESP와 센서 Sleep의 관계
+
+ESP32-S3 sleep과 VL53L8CX sleep은 서로 독립적이다. ESP가 sleep에 들어간다는
+이유만으로 고정 3V3에 연결된 센서가 자동으로 sleep에 들어가지는 않는다. 반드시
+다음 순서로 센서를 먼저 정리한다.
+
+```text
+tof_stop_ranging
+  → VL53L8CX power mode 전환 또는 Vext OFF
+  → ESP timer wakeup 설정
+  → ESP light sleep 시작(현재 시연 기준)
+```
+
+VL53L8CX ULD의 power mode는 다음과 같다.
+
+- `WAKEUP`: HP idle, 명령 대기
+- `SLEEP`: LP idle, firmware/configuration/calibration 유지
+- `DEEP_SLEEP`: 수 µA 수준, firmware/configuration/calibration 소실
+
+ULD의 `vl53l8cx_set_power_mode()`로 전환할 수 있지만 **ranging 중에는 변경하지
+않고 먼저 stop**해야 한다. 현재 `tof_driver`는 이 API를 외부에 노출하지 않으며
+현재 애플리케이션에도 ESP sleep 호출이 없으므로 둘 다 구현이 필요하다.
+
+### 9.3 이 하드웨어의 권장 방식
+
+현재 Pololu `VIN`은 고정 `3V3`에 연결되어 있다. 배선을 바꾸지 않는다면 다음 방식이
+가능하다.
+
+- ESP **light sleep** + VL53L8CX `SLEEP`: ESP RAM과 ULD context가 유지되어 가장
+  단순하며, wake 후 `WAKEUP → start_ranging`으로 복귀
+- ESP **deep sleep** + VL53L8CX `SLEEP`: ESP가 재부팅되어 일반 RAM의 ULD context를
+  잃으므로 sleeping sensor에 재접속하는 별도 복구 코드 필요
+- ESP **deep sleep** + VL53L8CX `DEEP_SLEEP`: sensor firmware/configuration도
+  잃으므로 wake 후 sensor WAKEUP과 전체 `tof_init()` 경로 필요
+
+따라서 **배선 변경 없이 먼저 구현할 때는 light sleep + sensor SLEEP**이 가장
+간단하다. 더 낮은 시스템 전력이 중요하면 아래처럼 센서 VIN을 Vext로 변경하는 방식을
+배선 담당자와 검토한다.
+
+```text
+GPIO36 LOW  → Vext ON → 잠시 안정화 → tof_init → 측정
+측정 종료   → tof_stop_ranging → tof_deinit → GPIO36 HIGH(Vext OFF)
+            → ESP deep sleep을 설정된 시간만큼 실행
+```
+
+이 방식은 센서의 내부 `SLEEP`이 아니라 **carrier 전체 전원 차단**이다. 매 wake마다
+약 84 KiB sensor firmware 전송을 포함한 전체 초기화가 필요하지만, 10초 창에서 한
+프레임을 얻기에는 충분한지 실제 보드에서 부팅 시간과 전류를 측정해 확정한다.
+
+Vext 방식은 매번 전체 초기화가 필요하지만 deep-sleep 복구 흐름이 명확하고 carrier
+전체의 대기 전력을 제거할 수 있다. 다만 Heltec Vext가 Pololu의 peak 약 150 mA를
+안정적으로 공급하는지, LoRa TX와 동시에 전압 강하가 없는지는 실측한다.
+
+### 9.4 변경 가능한 설정
+
+개발 기본값은 Kconfig에 둘 수 있지만 시연값은 Mac 웹 UI → A → LoRa downlink로
+runtime 변경한다.
+
+- sleep duration seconds: preset 25 또는 10
+- awake window seconds: preset 10
+- measurements per wake: preset 1
+- 최대 재시도: 3
+- 적용 대상: B-1, B-2, 또는 둘 다
+- 노드별 설치 방향: rotation/mirror
+
+설정은 version/revision과 함께 전송하고 B가 ACK한 다음 cycle부터 적용한다. 현재
+코드는 `vTaskDelay` 기반이므로 이 runtime 설정과 실제 sleep 전환은 아직 구현 전이다.
+
+---
+
+## 10. LoRa 구현 현황과 최종 확장 계획
+
+### 10.1 현재 구현 상태
+
+현재 소스에는 다음 LoRa baseline이 구현되어 있다.
+
+- 외부 SX1262 driver와 `components/lora_radio` wrapper
+- Heltec V3 계열용 SPI/NSS/RESET/BUSY, TCXO, DIO2 RF switch 설정
+- 922.1 MHz point-to-point, 5 dBm, SF7, BW125 kHz, CR4/5, CRC
+- `components/lora_protocol` v1 binary 측정/status packet과 CRC16
+- sender/receiver 역할별 build와 protocol host test
+
+아직 확인되지 않은 것은 A↔B-1 **실제 무선 송수신**이다. B-1 ToF 검출이 막혀 최종
+업로드를 보류한 상태다. 또한 v1에는 CONFIG downlink/ACK, 두 노드 충돌 회피, radio
+sleep, UI serial bridge가 없다.
+
+### 10.2 확정된 하드웨어/무선 조건
+
+radio는 보드 내장 **SX1262**, 구매 대역은 **863–928 MHz**로 확인됐다. 현재 사용
+핀과 설정은 0.1.4절과 `sdkconfig.defaults`를 기준으로 한다. A와 B-1에는 안테나가
+장착되어 있다.
+
+실사용 전 남은 외부 조건은 다음과 같다.
+
+- 각 보드의 정확한 V3.x revision을 실크로 기록한다.
+- 실제 사용 장소와 조건에 맞는 KR920 채널/출력/airtime 규정을 최종 확인한다.
+- B-2의 대역 안테나, 포트, MAC, ToF 배선을 확인한다.
+
+### 10.3 권장 소프트웨어 구조
+
+```text
+components/
+└── lora_radio/
+    ├── include/lora_radio.h
+    ├── lora_radio.c
+    └── CMakeLists.txt
+```
+
+상위 코드는 특정 radio driver에 직접 의존하지 않고 다음 인터페이스만 사용한다.
+
+```c
+esp_err_t lora_radio_init(void);
+esp_err_t lora_radio_send(const uint8_t *payload, size_t length);
+esp_err_t lora_radio_receive(uint8_t *payload, size_t capacity,
+                             size_t *received_length,
+                             lora_rx_metadata_t *metadata);
+```
+
+현재 wrapper는 송수신과 radio 설정을 담당한다. protocol v2가
+WAKE/FRAME/STATUS/CONFIG_SET/CONFIG_ACK/SLEEPING과 sleep/awake 누적시간을 이미
+제공하므로(0.1.4절), 남은 작업은 이를 사용하는 쪽이다. A에는 양방향 설정 queue와
+USB bridge interface를, B에는 node-specific TX slot 적용과 sleep/wakeup interface를
+추가한다. `lora_radio`에는 SX1262 warm sleep/wakeup 함수가 아직 없어 확장이 필요하다.
+
+### 10.4 LoRa 완료 기준
+
+1. B-1 고정 test packet과 실제 ToF frame을 A에서 수신
+2. I2C/SPI GPIO 충돌 없이 node ID, sequence, 64 zone, RSSI/SNR 확인
+3. UI 설정을 A가 queue하고 B-1 WAKE 뒤 CONFIG_ACK까지 왕복
+4. B-1 배터리 독립 상태에서 profile 1/2 전환과 sleep telemetry 확인
+5. B-2 추가 후 두 node frame/설정 구분과 충돌 회피 확인
+6. 지역 주파수/출력/airtime 규정 및 장시간 안정성 확인
+
+---
+
+## 11. 구현상 알려진 제한과 후속 작업
+
+우선순위 순으로 처리한다.
+
+1. ~~**B-1 ToF 복구**~~ — 완료. 0.1.3절 참조.
+2. ~~**protocol v2**~~ — 완료. 0.1.4절 참조.
+2-a. **I2C 속도 하향 검토**: `app_config.h`의 `TOF_I2C_SPEED_HZ`가 현재 **1 MHz**다.
+   `i2cdiag` hold test는 100 kHz에서 안정적으로 동작했다. 점퍼 배선 + 배터리 구동 +
+   수조 환경이라는 조건에서 1 MHz는 여유가 없고 Pololu도 통신선 8 cm 이하를
+   권고한다. **400 kHz로 낮추기를 권한다.** 8×8을 10 Hz로 받는 데 전혀 부족하지 않다.
+3. **실제 저전력 주기**: sensor SLEEP/WAKEUP, SX1262 warm sleep, ESP light sleep과
+   25/10 및 10/10 profile을 구현한다. 이때 `lora_protocol_tx_slot_offset_ms()`를
+   송신 경로에 연결해 두 노드의 wake 동기 송신 충돌을 막는다.
+4. **A bridge와 Mac UI**: 두 node별 설정 queue, ACK/retry, matrix/RSSI/SNR/state 및
+   runtime profile 입력을 구현한다.
+5. **B-1 단일 노드 검증 후 B-2 추가**: `node_id=1/2`, TX slot/jitter, 설치 방향
+   transform을 확인한다.
+6. **실제 baseline calibration**: 현재 `HEIGHT_DEMO`의 1000 mm 상수를 제거하고 두
+   설치 위치를 개별 보정한다.
+7. protocol 쪽 시간 필드는 v2에서 해결됐다. 다만 `tof_frame_t.timestamp_us`는 여전히
+   32-bit이므로 장시간 운용 시 driver 쪽 wrap 처리가 남아 있다.
+8. 센서 초기화 실패/재시작 시 I2C handle과 자원을 정리한다.
+9. 장기 운용을 위한 watchdog, brownout, retry/backoff, 상태 telemetry를 추가한다.
+10. 필요 시 설정과 baseline을 NVS에 저장하고 명시적인 recalibration 절차를 만든다.
+
+참고로 기존 dual-sensor 코드는 같은 버스에서 LPn으로 주소를 바꾸는 골격이 있지만
+현재 제품은 센서 1개이므로 사용하지 않는다. `DUAL_I2C_BUS` 모드는 센서별 SDA/SCL
+핀을 따로 보관하지 않아 진정한 2-bus 배선 설정이 불완전하므로, 센서 2개로 확장할
+때 구조 수정이 필요하다.
+
+---
+
+## 12. 단계별 완료 조건
+
+### M0 — 환경 재현
+
+- Mac VS Code에서 ESP-IDF v5.4.4가 선택됨
+- `ESP-IDF: Doctor Command` 통과
+- `idf.py --version`이 v5.4.4 출력
+
+### M1 — 보드 없는 빌드
+
+- `idf.py build` 성공
+- host test 4개 이상 통과
+- managed component 4.0.1 재생성 확인
+
+### M2 — ESP 보드 플래시
+
+- macOS에서 serial port 확인
+- flash 성공
+- ESP32-S3 boot log 확인
+
+### M3 — ToF 1개 bring-up
+
+- 프레임당 64 zone 출력 — ✅ B-1/B-2 확인
+- 물체 이동 시 거리 변화 — ✅
+- 헤더 납땜 후 무접촉 상태에서 프레임 유지 — ✅ **B-2 통과**, B-1은 배선 수리 중
+- 정지 표면 repeatability 기록 — 미수행
+
+**M3는 B-2 기준으로 통과, B-1은 미통과다.**
+
+### M4 — 응용 알고리즘 검증
+
+- 센서 설치 높이 실측 반영
+- 물/고형물 샘플 데이터 수집
+- specular 및 water-level 결과의 오차/임계값 결정
+- 임시 1000 mm baseline 제거
+
+### M5 — 저전력 주기
+
+- VL53L8CX/SX1262/ESP 순서대로 sleep 진입 — ✅
+- profile 1의 25초 및 profile 2의 10초 timer wake — ✅ `last_sleep` 24999 / 9999 ms
+- 각 10초 wake window에서 1회 측정, 실패 시 재시도 — ✅ `retries=0`
+- 설정 ACK 후 다음 cycle부터 새 주기 적용 — ✅
+- 반복 동작 중 센서 초기화 실패와 전압 강하 없음 — ✅ B-2 기준
+- **sleep/active 평균 및 peak 전류 측정 — 미수행 (inline meter 필요)**
+
+**전류 실측을 제외한 M5 항목은 B-2에서 모두 통과했다.**
+
+### M6 — LoRa
+
+- SX1262 point-to-point build와 안테나 확인 — ✅
+- B→A ToF frame과 A→B config/ACK 왕복 — ✅ B-2에서 검증
+- 배터리 독립 동작 — ✅ B-2. 송신 출력 5 dBm으로 해결(0.1.11절)
+- 두 node 충돌 회피(TX slot 연결) — 미수행. B-1 복구 후
+- 전원 복구 시험 — ✅ 재부팅 후 A가 설정을 자동 재적용
+
+### M7 — 시연 UI 및 수조 통합
+
+- 로컬 웹 UI 구현 — ✅ `tools/ui/`. B-2 실시간 표시 확인
+- profile 변경 — ✅ UI 버튼과 A의 `CFG` 명령으로 동작
+- 두 8×8 matrix를 node별로 보존하고 방향 transform 적용 — ✅ 표시 단계에서만 변환
+- 빈 수조 baseline 캡처와 높이 표시 — ✅ 구현, 실제 수조에서 미검증
+- **두 노드를 합친 3D map — 미구현.** 설치 위치·각도 실측 필요(0.1.8절)
+- profile 1 약 70초 + profile 2 약 60초 시연 리허설 — 미수행
+- inline meter로 평균 전류 차이 확인 — 미수행
+
+---
+
+## 13. 최종 실행 체크리스트
+
+- [x] 보드 제품군이 Heltec WiFi LoRa 32임을 구매 내역으로 확인했다.
+- [ ] 세 보드 PCB의 정확한 V3.x revision을 실크로 확인했다.
+- [x] 내장 LoRa가 SX1262, 구매 대역이 863–928 MHz임을 확인했다.
+- [x] ToF가 Pololu VL53L8CX carrier #3419임을 확인했다.
+- [x] Pololu VIN이 Heltec 고정 3V3에 연결됐음을 확인했다.
+- [x] `SPI/I2C=GND`, SDA=GPIO41, SCL=GPIO42 배선을 확인했다.
+- [x] LP가 HIGH임을 확인했다(센서가 `0x29`에서 정상 응답).
+- [x] 실제 GPIO 연결표가 `app_config.h`와 일치한다.
+- [x] Mac에 ESP-IDF v5.4.4를 설치하고 역할별 빌드했다.
+- [x] Mac에서 diagnostic/sender/receiver/i2cdiag 산출물을 새로 생성했다.
+- [x] `idf.py build`가 성공했다.
+- [x] host test 4개가 protocol v2 기준으로 통과했다.
+- [x] A, B-1, B-2 **세 보드의 MAC**을 확인하고 포트 이름이 신원이 아님을 확인했다.
+- [x] A, B-1, B-2 세 보드에 863–928 MHz용 안테나를 연결했다.
+- [x] SX1262 driver, wrapper를 구현·빌드했다.
+- [x] VL53L8CX 64 zone 측정을 B-1과 B-2 양쪽에서 확인했다.
+- [x] `ESP_ERR_NOT_FOUND` 원인을 규명했다(보드 오인 + 헤더 미납땜).
+- [x] B-1/B-2 sender와 A receiver의 실제 LoRa 수신을 확인했다(RSSI/SNR 포함).
+- [x] A에서 두 노드를 `node_id` 1/2로 구분해 수신했다.
+- [x] protocol v2를 구현하고 호스트 테스트를 통과했다.
+- [x] B-1/B-2 Pololu carrier 헤더를 납땜했다.
+- [x] 세 보드에 protocol v2 펌웨어를 업로드했다.
+- [x] B-2를 식별하고 `node_id=2`로 업로드했다.
+- [x] A bridge를 구현하고 `CFG`/`STATUS`/`MODE` 명령을 검증했다.
+- [x] CONFIG_SET/CONFIG_ACK 무선 왕복을 확인했다.
+- [x] sensor/radio 정지 후 ESP light sleep, timer wake, sensor 복귀를 확인했다.
+- [x] profile 1(25/10/1)과 profile 2(10/10/1)를 무선으로 전환했다.
+- [x] 노드 재부팅 후 A가 설정을 자동으로 재적용하는 것을 확인했다.
+- [x] Mac 로컬 UI를 구현하고 B-2 실시간 표시를 확인했다.
+- [x] B-1 고장 원인을 특정했다 (센서 불량. 보드·배선은 정상).
+- [ ] **B-1의 Pololu #3419 carrier를 교체했다.**
+- [x] **배터리만으로 B 노드를 독립 운용했다** (B-2).
+- [ ] 두 node의 충돌 회피(TX slot 연결)와 설치 방향 transform을 확인했다.
+- [ ] 노드 설치 위치·각도·높이를 실측하고 합친 3D map을 붙였다.
+- [x] B-2로 빈 수조 baseline을 잡고 높이 표시를 확인했다(흰 종이 바닥).
+- [ ] 최종 설치 위치에서 baseline을 확정하고 placeholder 1000 mm를 제거했다.
+- [ ] 지역 주파수/출력/airtime 조건을 최종 확인했다.
+- [ ] inline meter로 두 profile의 평균 전류 차이를 측정했다.
+
+저전력 cycle, 무선 설정 변경, A bridge, Mac UI까지 구현·검증됐고 **B-2에서는 두
+프로파일이 실제로 동작한다.** 남은 실물 블로커는 **B-1 배선 복구**와 **배터리 구동**
+두 가지이며, 둘 다 해결되기 전에는 2-node 수조 시연을 진행할 수 없다. 그 뒤로는
+설치 실측(합친 3D map, baseline)과 inline meter 전력 측정이 남는다.
+
+---
+
+## 14. 하드웨어 및 저전력 공식 자료
+
+- Heltec WiFi LoRa 32 V3 제품 정보:
+  https://heltec.org/project/wifi-lora-32-v3/
+- Heltec WiFi LoRa 32 hardware update log(V3.1 C-to-C, V3.2 변경):
+  https://docs.heltec.org/en/node/esp32/wifi_lora_32/hardware_update_log.html
+- Heltec WiFi LoRa 32 V3.2 schematic(GPIO36/Vext):
+  https://resource.heltec.cn/download/WiFi_LoRa_32_V3/WiFi_LoRa_32_V3.2_Schematic_Diagram.pdf
+- Pololu VL53L8CX carrier #3419 제품/배선 정보:
+  https://www.pololu.com/product/3419
+- Pololu VL53L8CX carrier #3419 schematic:
+  https://www.pololu.com/file/0J2031/vl53l8cx-time-of-flight-sensor-schematic.pdf
+- ST VL53L8CX 데이터시트:
+  https://www.st.com/resource/en/datasheet/vl53l8cx.pdf
+- ST VL53L8CX ULD 사용자 설명서 UM3109:
+  https://www.st.com/resource/en/user_manual/um3109-a-guide-for-using-the-vl53l8cx-lowpower-highperformance-timeofflight-multizone-ranging-sensor-stmicroelectronics.pdf
+- ESP-IDF v5.4 ESP32-S3 low-power guide:
+  https://docs.espressif.com/projects/esp-idf/en/v5.4/esp32s3/api-guides/low-power-mode/index.html

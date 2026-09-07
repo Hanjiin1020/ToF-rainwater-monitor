@@ -1,0 +1,15 @@
+{
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "idf.currentSetup": "/Users/hanjiin/.espressif/v5.4.4/esp-idf",
+  "clangd.path": "/Users/hanjiin/.espressif/tools/esp-clang/esp-18.1.2_20240912/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/Users/hanjiin/ToF/build"
+  ],
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ]
+}

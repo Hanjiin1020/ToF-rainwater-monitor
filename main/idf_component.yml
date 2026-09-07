@@ -1,0 +1,5 @@
+dependencies:
+  rjrp44/vl53l8cx:
+    version: "4.0.1"
+description: ESP32-S3 VL53L8CX height and surface experiments
+version: 0.1.0

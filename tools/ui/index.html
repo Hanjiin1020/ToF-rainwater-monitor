@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>ToF 수조 모니터</title>
+<style>
+:root {
+  --bg: #14161a; --panel: #1c1f26; --line: #2c313b;
+  --text: #e6e9ef; --dim: #99a1b0; --accent: #4da3ff;
+  --ok: #4ec9a5; --warn: #e8b84b; --bad: #e8685d;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+         padding: 12px 16px; border-bottom: 1px solid var(--line); }
+h1 { font-size: 15px; margin: 0; font-weight: 600; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(560px, 1fr));
+        gap: 14px; padding: 14px; }
+.card { background: var(--panel); border: 1px solid var(--line);
+        border-radius: 8px; padding: 14px; }
+.card h2 { font-size: 14px; margin: 0 0 10px; display: flex;
+           align-items: center; gap: 8px; }
+.row { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 8px; }
+.kv { color: var(--dim); }
+.kv b { color: var(--text); font-weight: 600; }
+table.zones { border-collapse: collapse; margin: 8px 0; }
+table.zones td { width: 46px; height: 30px; text-align: center; font-size: 11px;
+                 border: 1px solid var(--bg); color: #0d0f12; font-weight: 600; }
+button, select, input { background: #262b34; color: var(--text);
+        border: 1px solid var(--line); border-radius: 5px; padding: 5px 9px;
+        font: inherit; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: #08101c; border-color: var(--accent); }
+input[type=number] { width: 62px; cursor: text; }
+.controls { display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+            margin: 8px 0; }
+.log { background: #0f1115; border: 1px solid var(--line); border-radius: 6px;
+       padding: 8px; height: 150px; overflow-y: auto; font-size: 11px;
+       color: var(--dim); white-space: pre-wrap; }
+canvas { background: #0f1115; border: 1px solid var(--line); border-radius: 6px;
+         display: block; width: 100%; }
+.hint { color: var(--dim); font-size: 11px; margin: 4px 0 0; }
+h3.sub { font-size: 12px; font-weight: 600; color: var(--dim);
+         margin: 14px 0 4px; }
+.badge { font-size: 11px; padding: 1px 7px; border-radius: 999px;
+         border: 1px solid var(--line); color: var(--dim); }
+
+/* The headline judgment, kept at the top of each card so it is read before
+   the 64 numbers underneath it. */
+.assess { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+          background: #0f1115; border: 1px solid var(--line);
+          border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+.assess .lv { font-size: 19px; font-weight: 700; display: flex;
+              align-items: center; gap: 8px; letter-spacing: .04em; }
+.assess .pc { font-size: 26px; font-weight: 700; }
+.assess .pc small { font-size: 12px; color: var(--dim); font-weight: 400; }
+.assess .bar { flex: 1; min-width: 120px; height: 10px; border-radius: 5px;
+               background: #232a35; overflow: hidden; }
+.assess .bar > i { display: block; height: 100%; transition: width .4s; }
+.assess .src { color: var(--dim); font-size: 11px; line-height: 1.5; }
+.sw { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+#summary { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+           padding: 10px 16px; border-bottom: 1px solid var(--line);
+           background: #12151b; font-size: 12px; color: var(--dim); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>빗물 지킴이 · 관리자</h1>
+  <a href="/" style="color:var(--accent);text-decoration:none">← 처음으로</a>
+  <a href="/user" style="color:var(--accent);text-decoration:none">사용자 화면</a>
+  <span id="serial" class="badge">연결 확인 중</span>
+  <span class="kv">표시 <select id="view">
+    <option value="height">높이 (baseline − 현재)</option>
+    <option value="raw">원본 거리</option>
+  </select></span>
+  <span class="kv">단위 상한 <input id="scale" type="number" value="300" min="20" step="10"> mm</span>
+</header>
+
+<div id="summary"></div>
+
+<div class="grid" id="cards"></div>
+
+<div style="padding: 0 14px 14px;">
+  <div class="card">
+    <h2>A 로그</h2>
+    <div class="log" id="log"></div>
+    <div class="controls">
+      <input id="cmd" type="text" placeholder="CFG 2 25 10 1" style="flex:1; min-width:220px;">
+      <button onclick="sendRaw()">전송</button>
+      <button onclick="post('/api/command',{line:'STATUS'})">STATUS</button>
+    </div>
+    <p class="hint">A가 이해하는 명령: <code>CFG &lt;node&gt; &lt;sleep_s&gt; &lt;wake_s&gt; &lt;measure&gt;</code> · <code>STATUS</code> · <code>MODE HUMAN|JSON|BOTH</code></p>
+  </div>
+</div>
+
+<script>
+const NODES = [1, 2];
+let state = null;
+
+async function post(path, body) {
+  const res = await fetch(path, {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  return res.json();
+}
+function sendRaw() {
+  const box = document.getElementById('cmd');
+  if (box.value.trim()) { post('/api/command', {line: box.value}); box.value = ''; }
+}
+document.getElementById('cmd').addEventListener('keydown', e => {
+  if (e.key === 'Enter') sendRaw();
+});
+
+/* Raw frames are stored per node exactly as received; rotation and mirroring
+   are display-only, so the two nodes can face each other without either
+   original being lost. */
+function transform(values, s) {
+  const at = (r, c) => values[r * 8 + c];
+  const out = new Array(64);
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      let sr = r, sc = c;
+      if (s.rotation === 90)  { sr = 7 - c; sc = r; }
+      if (s.rotation === 180) { sr = 7 - r; sc = 7 - c; }
+      if (s.rotation === 270) { sr = c;     sc = 7 - r; }
+      if (s.mirror_x) sc = 7 - sc;
+      if (s.mirror_y) sr = 7 - sr;
+      out[r * 8 + c] = at(sr, sc);
+    }
+  }
+  return out;
+}
+
+function heightsOf(node, settings) {
+  /* frame_valid has the zones the node rejected blanked out by the server.
+     Using the raw frame here subtracts the 65535 filler from the baseline and
+     draws -65204 as if it were a height. */
+  const source = node.frame_valid || node.frame;
+  if (!source) return null;
+  const frame = transform(source, settings);
+  if (!settings.baseline) return {values: frame, kind: 'raw'};
+  const base = transform(settings.baseline, settings);
+  /* null means either that zone has no trusted floor level, or the node did
+     not get a valid reading this frame. Show nothing rather than a height
+     measured against garbage. */
+  return {values: frame.map((d, i) =>
+            (base[i] === null || d === null) ? null : base[i] - d),
+          kind: 'height'};
+}
+
+function colorFor(value, kind, limit) {
+  if (value === null || value === undefined) return '#2a2f38';
+  if (kind === 'raw') {
+    const t = Math.max(0, Math.min(1, value / 2000));
+    return `hsl(${210 - t * 190}, 70%, ${28 + t * 42}%)`;
+  }
+  const t = Math.max(-1, Math.min(1, value / limit));
+  if (t >= 0) return `hsl(${140 - t * 140}, 72%, ${24 + t * 46}%)`;
+  return `hsl(210, 45%, ${22 + Math.abs(t) * 16}%)`;
+}
+
+function zoneTable(values, kind, limit) {
+  let html = '<table class="zones">';
+  for (let r = 0; r < 8; r++) {
+    html += '<tr>';
+    for (let c = 0; c < 8; c++) {
+      const v = values[r * 8 + c];
+      const text = (v === null || v === undefined) ? '—' : Math.round(v);
+      html += `<td style="background:${colorFor(v, kind, limit)}">${text}</td>`;
+    }
+    html += '</tr>';
+  }
+  return html + '</table>';
+}
+
+/* The original per-zone bars, drawn inside a tank outline so the readings sit
+   in the physical volume they came from. Kept alongside the smooth surface
+   because the discrete form shows exactly which zone reported what. */
+function drawTank(canvas, values, kind, limit, nodeId) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width = canvas.clientWidth * 2;
+  const h = canvas.height = 520;
+  ctx.setTransform(2, 0, 0, 2, 0, 0);
+  const W = w / 2, H = h / 2;
+  ctx.clearRect(0, 0, W, H);
+  if (!values) return;
+
+  const cell = 30, originX = W / 2, originY = H * 0.34, wallH = 120;
+  const P = (x, y, z) => ({
+    x: originX + (x - y) * cell * 0.86,
+    y: originY + (x + y) * cell * 0.42 - z,
+  });
+  const poly = (pts, fill, stroke, width) => {
+    ctx.beginPath();
+    pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+    ctx.closePath();
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = width || 1; ctx.stroke(); }
+  };
+
+  const L = -0.5, R = 7.5;   // tank walls sit half a zone outside the grid
+  // Back walls first, then the floor, so the bars land on top of both.
+  poly([P(L,L,0), P(R,L,0), P(R,L,wallH), P(L,L,wallH)], 'rgba(77,163,255,0.06)', '#2c313b');
+  poly([P(L,L,0), P(L,R,0), P(L,R,wallH), P(L,L,wallH)], 'rgba(77,163,255,0.10)', '#2c313b');
+  poly([P(L,L,0), P(R,L,0), P(R,R,0), P(L,R,0)], 'rgba(255,255,255,0.04)', '#39404d');
+
+  for (let k = 0; k <= 8; k++) {
+    const t = L + k;
+    ctx.strokeStyle = 'rgba(120,132,150,0.18)'; ctx.lineWidth = 1;
+    ctx.beginPath();
+    let a = P(t, L, 0), b = P(t, R, 0);
+    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+    a = P(L, t, 0); b = P(R, t, 0);
+    ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+
+  // Painter's algorithm: screen depth grows with (row + col), so draw the
+  // diagonals from the far corner forwards or tall bars will overlap wrongly.
+  for (let sum = 0; sum <= 14; sum++) {
+    for (let r = 0; r <= 7; r++) {
+      const c = sum - r;
+      if (c < 0 || c > 7) continue;
+      const raw = values[r * 8 + c];
+      if (raw === null || raw === undefined) continue;
+
+      const lift = kind === 'height'
+        ? Math.max(0, Math.min(1.6, raw / limit)) * 100
+        : Math.max(0, Math.min(1.6, (2000 - raw) / 2000)) * 100;
+      const t = P(c, r, lift), s = cell * 0.86, u = cell * 0.42;
+      const face = colorFor(raw, kind, limit);
+
+      if (lift > 1.5) {
+        poly([{x:t.x - s, y:t.y + u}, {x:t.x, y:t.y + 2*u},
+              {x:t.x, y:t.y + 2*u + lift}, {x:t.x - s, y:t.y + u + lift}],
+             'rgba(0,0,0,0.42)');
+        poly([{x:t.x, y:t.y + 2*u}, {x:t.x + s, y:t.y + u},
+              {x:t.x + s, y:t.y + u + lift}, {x:t.x, y:t.y + 2*u + lift}],
+             'rgba(0,0,0,0.22)');
+      }
+      poly([{x:t.x, y:t.y}, {x:t.x + s, y:t.y + u},
+            {x:t.x, y:t.y + 2*u}, {x:t.x - s, y:t.y + u}], face, '#0f1115');
+    }
+  }
+
+  // Rim and corner posts last so they read as the near edge of the tank.
+  poly([P(L,L,wallH), P(R,L,wallH), P(R,R,wallH), P(L,R,wallH)], null, '#3f4755', 1.2);
+  [[L,L],[R,L],[L,R],[R,R]].forEach(([x,y]) => {
+    const a = P(x,y,0), b = P(x,y,wallH);
+    ctx.strokeStyle = '#3f4755'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+  });
+
+  // Where each node physically sits on the frame: B-2 on the low-column side,
+  // B-1 facing it from the other. The marker stays put while the grid is
+  // rotated, so it doubles as a target - turn the display until the near
+  // readings sit next to the sensor that produced them. B-2's floor survey has
+  // column 0 nearest (305 mm) and column 7 furthest (428 mm), which is what
+  // puts it at the x = L edge.
+  if (nodeId === 2) {
+    drawSensor(P, poly, ctx, L, (L + R) / 2, wallH, 1, 0);
+  } else {
+    drawSensor(P, poly, ctx, R, (L + R) / 2, wallH, -1, 0);
+  }
+}
+
+/* A marker on the rim showing roughly where the node sits and which way it
+   looks. Purely illustrative: the real mounting angle is not known to the UI,
+   so the beam is drawn at a representative tilt rather than a measured one.
+   (fx, fy) is the facing direction in grid units. */
+function drawSensor(P, poly, ctx, x, y, z, fx, fy) {
+  const w = 0.55, d = 0.35, h = 26, tilt = 12;
+  const top = z + h, bottom = z - 4;
+  const rx = fy, ry = -fx;                     // perpendicular to the facing
+  // corner at (forward sign, sideways sign)
+  const c = (f, r) => [x + f * d * fx + r * w * rx,
+                       y + f * d * fy + r * w * ry];
+
+  const [bl0, bl1] = c(-1, -1), [br0, br1] = c(-1, 1);
+  const [fr0, fr1] = c(1, 1),   [fl0, fl1] = c(1, -1);
+
+  // Beam from the lens down across the floor, fanning a little.
+  const nose = P(x + d * fx, y + d * fy, top - tilt * 0.5);
+  [[-1.6, 5.2], [0, 6.0], [1.6, 5.2]].forEach(([side, reach], i) => {
+    const hit = P(x + reach * fx + side * rx, y + reach * fy + side * ry, 0);
+    ctx.strokeStyle = i === 1 ? 'rgba(77,163,255,0.55)' : 'rgba(77,163,255,0.25)';
+    ctx.lineWidth = i === 1 ? 1.4 : 1;
+    ctx.setLineDash(i === 1 ? [] : [4, 4]);
+    ctx.beginPath(); ctx.moveTo(nose.x, nose.y); ctx.lineTo(hit.x, hit.y); ctx.stroke();
+  });
+  ctx.setLineDash([]);
+
+  // Housing: the front edge sits lower than the back, which is the tilt.
+  poly([P(bl0, bl1, top), P(br0, br1, top),
+        P(fr0, fr1, top - tilt), P(fl0, fl1, top - tilt)], '#7f8b9e', '#20242c');
+  poly([P(fl0, fl1, top - tilt), P(fr0, fr1, top - tilt),
+        P(fr0, fr1, bottom), P(fl0, fl1, bottom)], '#4b5567', '#20242c');
+  poly([P(br0, br1, top), P(fr0, fr1, top - tilt),
+        P(fr0, fr1, bottom), P(br0, br1, bottom)], '#5d6779', '#20242c');
+
+  // Lens on the tilted front face.
+  const [ll0, ll1] = [x + d * fx - w * 0.4 * rx, y + d * fy - w * 0.4 * ry];
+  const [lr0, lr1] = [x + d * fx + w * 0.4 * rx, y + d * fy + w * 0.4 * ry];
+  poly([P(ll0, ll1, top - tilt - 2), P(lr0, lr1, top - tilt - 2),
+        P(lr0, lr1, top - tilt - 12), P(ll0, ll1, top - tilt - 12)],
+       '#1b2f4a', '#4da3ff');
+}
+
+/* The demo's headline: mean fill over one wake window, mapped to four levels.
+   The server does the arithmetic so this page and the user map cannot drift
+   apart, and it always reports how many frames and zones went into the number
+   - claiming "10프레임 평균" when three arrived would be the easiest way to
+   mislead ourselves on the day. */
+function assessBlock(a) {
+  if (!a) {
+    return '<div class="assess"><span class="src">아직 프레임이 없습니다.</span></div>';
+  }
+  if (!a.level) {
+    return `<div class="assess">
+      <span class="src">판정 불가 — ${a.reason || '원인 미상'}
+      · ${a.frames}프레임 · ${a.zones}/64 zone</span></div>`;
+  }
+  const c = a.level.color;
+  return `<div class="assess">
+    <span class="lv" style="color:${c}"><i class="sw" style="background:${c}"></i>${a.level.name}</span>
+    <span class="pc" style="color:${c}">${a.fill_pct.toFixed(0)}<small> % 적치</small></span>
+    <span class="bar"><i style="width:${a.fill_pct}%;background:${c}"></i></span>
+    <span class="src">wake #${a.wake ?? '—'} · ${a.frames}프레임 평균 · ${a.zones}/64 zone<br>
+      평균 높이 ${a.mean_height_mm} mm · 기준 거리 ${a.baseline_mm} mm</span>
+  </div>`;
+}
+
+/* One number for the whole site, which is what the user map shows: the two
+   nodes look at the same tank from opposite sides, so their mean is the site.
+   The level has to come from looking that mean up in the table - deriving it
+   from either node's own level lets the badge disagree with the percentage
+   printed beside it whenever the two readings straddle a threshold. */
+function levelFor(fill, levels) {
+  let chosen = levels[0];
+  levels.forEach(l => { if (fill >= l.min) chosen = l; });
+  return chosen;
+}
+
+function summaryOf(nodes, levels) {
+  const got = nodes.map(n => n.assessment)
+                   .filter(a => a && a.fill_pct !== null && a.fill_pct !== undefined);
+  if (!got.length) return null;
+  const fill = got.reduce((sum, a) => sum + a.fill_pct, 0) / got.length;
+  return {fill, level: levelFor(fill, levels), count: got.length};
+}
+
+function ago(t, now) {
+  if (!t) return '—';
+  const d = now - t;
+  return d < 90 ? `${d.toFixed(0)}초 전` : `${(d / 60).toFixed(1)}분 전`;
+}
+
+/* 0 means the node could not read it; showing "—" beats showing 0.00 V. */
+function vbatText(mv) {
+  if (!mv) return '—';
+  const v = mv / 1000;
+  const mark = mv < 3400 ? ' ⚠' : '';
+  return v.toFixed(2) + ' V' + mark;
+}
+
+function dutyOf(tel) {
+  if (!tel || !tel.total_awake_ms) return null;
+  const total = tel.total_awake_ms + (tel.total_sleep_ms || 0);
+  return total ? (tel.total_awake_ms / total) * 100 : null;
+}
+
+function render() {
+  if (!state) return;
+  const badge = document.getElementById('serial');
+  badge.textContent = state.serial_ok ? 'A 연결됨' : 'A 연결 끊김';
+  badge.style.color = state.serial_ok ? 'var(--ok)' : 'var(--bad)';
+
+  const view = document.getElementById('view').value;
+  const limit = Number(document.getElementById('scale').value) || 300;
+  const cards = document.getElementById('cards');
+
+  const site = summaryOf(state.nodes, state.levels || []);
+  document.getElementById('summary').innerHTML = site
+    ? `<b style="color:${site.level.color};font-size:15px">
+         <i class="sw" style="background:${site.level.color}"></i> ${site.level.name}</b>
+       <b style="color:${site.level.color};font-size:15px">${site.fill.toFixed(0)}% 적치</b>
+       <span>서울시립대학교 · 센서 ${site.count}대 평균 · 사용자 지도에 이 값이 나갑니다</span>`
+    : '<span>지점 판정 대기 — baseline과 프레임이 모두 있어야 계산됩니다</span>';
+
+  cards.innerHTML = state.nodes.map(node => {
+    const s = state.settings[String(node.node)];
+    const result = heightsOf(node, s);
+    const kind = (view === 'height' && result && result.kind === 'height')
+      ? 'height' : 'raw';
+    const values = result ? result.values : null;
+    const stale = !node.last_seen || (state.now - node.last_seen) > 90;
+    const tel = node.telemetry || {};
+    const cfg = node.config || {};
+    const duty = dutyOf(tel);
+    const cs = node.config_state;
+
+    return `<div class="card">
+      <h2><span class="dot" style="background:${stale ? 'var(--bad)' : 'var(--ok)'}"></span>
+          B-${node.node}
+          <span class="badge">${node.last_type || '수신 없음'}</span>
+          ${cs ? `<span class="badge">설정 ${cs.state} rev=${cs.rev}</span>` : ''}
+      </h2>
+
+      ${assessBlock(node.assessment)}
+
+      <div class="row">
+        <span class="kv">마지막 <b>${ago(node.last_seen, state.now)}</b></span>
+        <span class="kv">RSSI <b>${node.rssi ?? '—'} dBm</b></span>
+        <span class="kv">SNR <b>${node.snr ?? '—'} dB</b></span>
+        <span class="kv">seq <b>${node.seq ?? '—'}</b></span>
+      </div>
+      <div class="row">
+        <span class="kv">설정 <b>${cfg.sleep_s ?? '—'}s / ${cfg.wake_s ?? '—'}s / ×${cfg.measure ?? '—'}</b></span>
+        <span class="kv">rev <b>${cfg.revision ?? '—'}</b></span>
+        <span class="kv">재시도 <b>${tel.retries ?? '—'}</b></span>
+      </div>
+      <div class="row">
+        <span class="kv">wake 횟수 <b>${tel.wakes ?? '—'}</b></span>
+        <span class="kv">직전 sleep <b>${tel.last_sleep_ms ?? '—'} ms</b></span>
+        <span class="kv">누적 awake <b>${((tel.total_awake_ms ?? 0) / 1000).toFixed(1)} s</b></span>
+        <span class="kv">누적 sleep <b>${((tel.total_sleep_ms ?? 0) / 1000).toFixed(1)} s</b></span>
+        <span class="kv">duty <b>${duty === null ? '—' : duty.toFixed(1) + ' %'}</b></span>
+        <span class="kv">배터리 <b>${vbatText(tel.vbat_mv)}</b></span>
+      </div>
+
+      <div class="controls">
+        <button onclick="post('/api/command',{line:'CFG ${node.node} 25 10 1'})">프로파일 1 (25/10)</button>
+        <button onclick="post('/api/command',{line:'CFG ${node.node} 10 10 1'})">프로파일 2 (10/10)</button>
+        <button onclick="post('/api/command',{line:'CFG ${node.node} 0 10 1'})">상시 동작</button>
+        <button class="primary" onclick="post('/api/command',{line:'CFG ${node.node} 25 10 10'})">시연 (25/10 ×10)</button>
+      </div>
+      <div class="controls">
+        <span class="kv">sleep <input id="sl${node.node}" type="number" value="${cfg.sleep_s ?? 25}" min="0"></span>
+        <span class="kv">wake <input id="wk${node.node}" type="number" value="${cfg.wake_s ?? 10}" min="1"></span>
+        <span class="kv">측정 <input id="mc${node.node}" type="number" value="${cfg.measure ?? 1}" min="1"></span>
+        <button onclick="sendCustom(${node.node})">적용</button>
+      </div>
+
+      <div class="controls">
+        <button class="primary" onclick="capture(${node.node})">빈 수조를 baseline으로</button>
+        <button onclick="post('/api/baseline',{node:${node.node},clear:true})">baseline 삭제</button>
+        <span class="kv">${s.baseline ? `baseline ${s.baseline_covered || 0}/64 zone (${s.baseline_frames || 0}프레임)` : 'baseline 없음'}</span>
+        <span class="kv">버퍼 <b>${node.buffered ?? 0}/${node.baseline_window ?? 30}</b></span>
+      </div>
+      <div class="controls">
+        <span class="kv">회전 <select onchange="setting(${node.node},'rotation',Number(this.value))">
+          ${[0, 90, 180, 270].map(d => `<option value="${d}" ${s.rotation === d ? 'selected' : ''}>${d}°</option>`).join('')}
+        </select></span>
+        <label class="kv"><input type="checkbox" ${s.mirror_x ? 'checked' : ''}
+          onchange="setting(${node.node},'mirror_x',this.checked)"> 좌우반전</label>
+        <label class="kv"><input type="checkbox" ${s.mirror_y ? 'checked' : ''}
+          onchange="setting(${node.node},'mirror_y',this.checked)"> 상하반전</label>
+      </div>
+
+      ${values ? zoneTable(values, kind, limit) : '<p class="hint">아직 프레임이 없습니다.</p>'}
+      <p class="hint">${kind === 'height'
+        ? 'baseline 대비 높이(mm). 양수 = 바닥보다 높음.'
+        : '원본 거리(mm). baseline을 잡으면 높이로 전환됩니다.'}</p>
+      <h3 class="sub">수조 안 zone별 막대</h3>
+      <canvas id="cvB${node.node}"></canvas>
+    </div>`;
+  }).join('');
+
+  state.nodes.forEach(node => {
+    const s = state.settings[String(node.node)];
+    const result = heightsOf(node, s);
+    const kind = (view === 'height' && result && result.kind === 'height')
+      ? 'height' : 'raw';
+    const tank = document.getElementById('cvB' + node.node);
+    if (tank) drawTank(tank, result ? result.values : null, kind, limit,
+                       node.node);
+  });
+
+  document.getElementById('log').textContent =
+    state.log.map(l => l.text).join('\n');
+}
+
+async function capture(node) {
+  const res = await post('/api/baseline', {node});
+  alert(res.msg);
+}
+function setting(node, key, value) {
+  post('/api/settings', {node, changes: {[key]: value}});
+}
+function sendCustom(node) {
+  const v = id => document.getElementById(id + node).value;
+  post('/api/command', {line: `CFG ${node} ${v('sl')} ${v('wk')} ${v('mc')}`});
+}
+document.getElementById('view').addEventListener('change', render);
+document.getElementById('scale').addEventListener('change', render);
+
+async function poll() {
+  try {
+    state = await (await fetch('/api/state')).json();
+    render();
+  } catch (e) { /* server restarting; try again next tick */ }
+  setTimeout(poll, 700);
+}
+poll();
+</script>
+</body>
+</html>

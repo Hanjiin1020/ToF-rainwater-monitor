@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>수조 스캔 — 한 센서로 두 위치</title>
+<style>
+:root {
+  --bg:#14161a; --panel:#1c1f26; --line:#2c313b; --text:#e6e9ef;
+  --dim:#99a1b0; --accent:#4da3ff; --ok:#4ec9a5; --warn:#e8b84b; --bad:#e8685d;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+     font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+       padding:12px 16px;border-bottom:1px solid var(--line)}
+h1{font-size:15px;margin:0;font-weight:600}
+a{color:var(--accent)}
+.wrap{padding:14px;display:grid;gap:14px;
+      grid-template-columns:repeat(auto-fit,minmax(400px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
+.card h2{font-size:14px;margin:0 0 10px;display:flex;align-items:center;gap:8px}
+.badge{font-size:11px;padding:1px 7px;border-radius:999px;
+       border:1px solid var(--line);color:var(--dim)}
+.kv{color:var(--dim)}.kv b{color:var(--text);font-weight:600}
+.row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:6px}
+.controls{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:8px 0}
+button,select,input{background:#262b34;color:var(--text);border:1px solid var(--line);
+        border-radius:5px;padding:5px 9px;font:inherit;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);color:#08101c;border-color:var(--accent)}
+button.ghost{opacity:.75}
+input[type=number]{width:62px;cursor:text}
+input[type=text]{width:120px;cursor:text}
+table.zones{border-collapse:collapse;margin:8px 0}
+table.zones td{width:44px;height:28px;text-align:center;font-size:11px;
+               border:1px solid var(--bg);color:#0d0f12;font-weight:600}
+.hint{color:var(--dim);font-size:11px;margin:4px 0 0}
+.steps{background:#0f1115;border:1px solid var(--line);border-radius:6px;
+       padding:10px 14px;margin:0 14px}
+.steps ol{margin:6px 0;padding-left:20px}
+.steps li{margin:3px 0;color:var(--dim)}
+.steps b{color:var(--text)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>수조 스캔 — 한 센서로 두 위치</h1>
+  <span id="serial" class="badge">연결 확인 중</span>
+  <span class="kv">노드 <select id="node"><option value="2">B-2</option><option value="1">B-1</option></select></span>
+  <span class="kv">높이 상한 <input id="scale" type="number" value="150" min="20" step="10"> mm</span>
+  <a href="/">← 실시간 모니터</a>
+</header>
+
+<div class="steps">
+  <b>순서</b>
+  <ol>
+    <li><b>수조를 비운 채</b> 센서를 위치 A에 두고 → <b>A 바닥 기록</b></li>
+    <li>센서를 위치 B로 옮기고 (수조는 계속 빈 상태) → <b>B 바닥 기록</b></li>
+    <li>수조에 물체를 넣습니다</li>
+    <li>센서를 위치 B에 둔 채 → <b>B 현재 기록</b></li>
+    <li>센서를 위치 A로 옮기고 → <b>A 현재 기록</b></li>
+  </ol>
+  <span class="hint">각 위치의 바닥과 현재를 짝지어 높이를 계산합니다. 옮기는 동안 기록은 그대로 보존되니 버튼을 누를 때만 갱신됩니다.</span>
+</div>
+
+<div class="wrap" id="slots"></div>
+
+<div style="padding:0 14px 14px">
+  <div class="card">
+    <h2>실시간 (지금 센서가 보는 것)</h2>
+    <div class="row">
+      <span class="kv">마지막 수신 <b id="lastSeen">—</b></span>
+      <span class="kv">RSSI <b id="rssi">—</b></span>
+      <span class="kv">유효 <b id="validNow">—</b></span>
+    </div>
+    <div id="live"></div>
+    <p class="hint">기록 버튼은 최근 프레임들의 zone별 중앙값을 씁니다. 위치를 옮긴 뒤에는 값이 안정될 때까지 20~30초 기다렸다가 누르세요.</p>
+  </div>
+</div>
+
+<script>
+const SLOTS = ['A', 'B'];
+let state = null, nodeId = 2;
+
+async function post(path, body) {
+  const r = await fetch(path, {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  return r.json();
+}
+
+/* Display-only, exactly like the live page: the stored capture is never
+   rewritten, so a wrong rotation costs nothing but a click. */
+function transform(values, s) {
+  const out = new Array(64);
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
+    let sr = r, sc = c;
+    if (s.rotation === 90)  { sr = 7 - c; sc = r; }
+    if (s.rotation === 180) { sr = 7 - r; sc = 7 - c; }
+    if (s.rotation === 270) { sr = c;     sc = 7 - r; }
+    if (s.mirror_x) sc = 7 - sc;
+    if (s.mirror_y) sr = 7 - sr;
+    out[r*8+c] = values[sr*8+sc];
+  }
+  return out;
+}
+
+function heights(slot) {
+  if (!slot.baseline || !slot.current) return null;
+  const base = transform(slot.baseline, slot);
+  const now  = transform(slot.current, slot);
+  return base.map((b, i) =>
+    (b === null || now[i] === null) ? null : b - now[i]);
+}
+
+function colorFor(v, limit) {
+  if (v === null || v === undefined) return '#2a2f38';
+  const t = Math.max(-1, Math.min(1, v / limit));
+  if (t >= 0) return `hsl(${140 - t*140}, 72%, ${24 + t*46}%)`;
+  return `hsl(210, 45%, ${22 + Math.abs(t)*16}%)`;
+}
+
+function grid(values, limit, raw) {
+  let html = '<table class="zones">';
+  for (let r = 0; r < 8; r++) {
+    html += '<tr>';
+    for (let c = 0; c < 8; c++) {
+      const v = values ? values[r*8+c] : null;
+      const bg = raw
+        ? (v === null ? '#2a2f38'
+           : `hsl(${210 - Math.min(1, v/2000)*190}, 70%, ${28 + Math.min(1, v/2000)*42}%)`)
+        : colorFor(v, limit);
+      html += `<td style="background:${bg}">${v === null || v === undefined ? '—' : Math.round(v)}</td>`;
+    }
+    html += '</tr>';
+  }
+  return html + '</table>';
+}
+
+function when(t) {
+  if (!t) return '없음';
+  const d = (Date.now()/1000) - t;
+  return d < 90 ? `${d.toFixed(0)}초 전` : `${(d/60).toFixed(0)}분 전`;
+}
+
+function render() {
+  if (!state) return;
+  const badge = document.getElementById('serial');
+  badge.textContent = state.serial_ok ? 'A 연결됨' : 'A 연결 끊김';
+  badge.style.color = state.serial_ok ? 'var(--ok)' : 'var(--bad)';
+
+  const limit = Number(document.getElementById('scale').value) || 150;
+  const node = state.nodes.find(n => n.node === nodeId) || {};
+  const settings = state.settings[String(nodeId)] || {};
+  const slots = settings.slots || {};
+
+  document.getElementById('slots').innerHTML = SLOTS.map(name => {
+    const s = slots[name] || {};
+    const h = heights(s);
+    const ready = s.baseline && s.current;
+    return `<div class="card">
+      <h2>위치 ${name}
+        <input type="text" placeholder="이름 (선택)" value="${s.label || ''}"
+               onchange="slotSet('${name}','label',this.value)">
+        <span class="badge">${ready ? '높이 계산됨' : '기록 대기'}</span>
+      </h2>
+      <div class="row">
+        <span class="kv">바닥 <b>${s.baseline_covered || 0}/64</b> · ${when(s.baseline_at)}</span>
+        <span class="kv">현재 <b>${s.current_covered || 0}/64</b> · ${when(s.current_at)}</span>
+      </div>
+      <div class="controls">
+        <button class="primary" onclick="cap('${name}','baseline')">${name} 바닥 기록</button>
+        <button onclick="cap('${name}','current')">${name} 현재 기록</button>
+        <button class="ghost" onclick="cap('${name}','clear')">지우기</button>
+      </div>
+      <div class="controls">
+        <span class="kv">회전 <select onchange="slotSet('${name}','rotation',Number(this.value))">
+          ${[0,90,180,270].map(d=>`<option value="${d}" ${s.rotation===d?'selected':''}>${d}°</option>`).join('')}
+        </select></span>
+        <label class="kv"><input type="checkbox" ${s.mirror_x?'checked':''}
+          onchange="slotSet('${name}','mirror_x',this.checked)"> 좌우</label>
+        <label class="kv"><input type="checkbox" ${s.mirror_y?'checked':''}
+          onchange="slotSet('${name}','mirror_y',this.checked)"> 상하</label>
+      </div>
+      ${ready ? grid(h, limit, false)
+              : `<p class="hint">${s.baseline ? '현재 상태를 기록하세요.' : '빈 수조에서 바닥을 먼저 기록하세요.'}</p>`}
+      ${ready ? `<p class="hint">양수 = 바닥보다 높음 (mm). 회색은 그 zone의 바닥 또는 현재가 없는 경우입니다.</p>` : ''}
+    </div>`;
+  }).join('');
+
+  document.getElementById('lastSeen').textContent =
+    node.last_seen ? when(node.last_seen) : '—';
+  document.getElementById('rssi').textContent =
+    node.rssi === null || node.rssi === undefined ? '—' : node.rssi + ' dBm';
+  const mask = node.valid_mask;
+  document.getElementById('validNow').textContent =
+    mask === null || mask === undefined ? '—'
+      : `${BigInt(mask).toString(2).split('1').length - 1}/64`;
+  document.getElementById('live').innerHTML =
+    node.frame ? grid(node.frame_valid || node.frame, limit, true)
+               : '<p class="hint">아직 프레임이 없습니다.</p>';
+}
+
+async function cap(slot, action) {
+  const res = await post('/api/slot', {node: nodeId, slot, action});
+  alert(res.msg);
+  poll();
+}
+function slotSet(slot, key, value) {
+  post('/api/slot', {node: nodeId, slot, action: 'settings', changes: {[key]: value}});
+}
+document.getElementById('node').addEventListener('change', e => {
+  nodeId = Number(e.target.value); render();
+});
+document.getElementById('scale').addEventListener('change', render);
+
+async function poll() {
+  try { state = await (await fetch('/api/state')).json(); render(); }
+  catch (e) { /* server restarting */ }
+}
+setInterval(poll, 900);
+poll();
+</script>
+</body>
+</html>
