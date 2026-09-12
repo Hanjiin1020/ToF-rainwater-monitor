@@ -16,8 +16,15 @@ body { margin:0; background:var(--wash); color:var(--ink);
        -webkit-font-smoothing:antialiased; }
 
 .utility { background:var(--navy); color:#c6d4e6; font-size:12px; }
-.utility .in { max-width:1240px; margin:0 auto; padding:7px 22px;
-               display:flex; justify-content:space-between; gap:12px; }
+.utility .in { max-width:1240px; margin:0 auto; padding:6px 22px;
+               display:flex; justify-content:space-between; gap:12px;
+               align-items:center; }
+.conns { display:flex; flex-direction:column; align-items:flex-end; gap:1px;
+         line-height:1.45; }
+.conns span { display:flex; align-items:center; gap:5px; }
+.conns i { width:6px; height:6px; border-radius:50%; background:#7f8ea3; }
+.conns i.up { background:#4ade80; }
+.conns i.down { background:#f87171; }
 .masthead { background:var(--white); border-bottom:1px solid var(--line); }
 .masthead .in { max-width:1240px; margin:0 auto; padding:15px 22px;
                 display:flex; align-items:center; gap:12px; }
@@ -48,6 +55,8 @@ body { margin:0; background:var(--wash); color:var(--ink);
 .wx.dry  { color:#a16207; background:#fdf6e3; border:1px solid #f0e0b0; }
 .wx.off  { color:var(--faint); background:var(--wash); border:1px solid var(--line); }
 .wx svg { width:15px; height:15px; }
+/* Same glyph as the map, sized for a line of text. */
+.wx-inline { width:17px; height:17px; vertical-align:-4px; margin-right:5px; }
 .panel .body { padding:16px 18px 18px; }
 
 svg.map { width:100%; height:auto; display:block; }
@@ -112,7 +121,10 @@ footer { max-width:1240px; margin:0 auto; padding:0 22px 34px;
 
 <div class="utility"><div class="in">
   <span>빗물받이 적치 모니터링 시스템</span>
-  <span id="conn">연결 확인 중</span>
+  <span class="conns">
+    <span id="conn"><i></i>연결 확인 중</span>
+    <span id="wxconn"></span>
+  </span>
 </div></div>
 
 <div class="masthead"><div class="in">
@@ -185,6 +197,11 @@ const SEOUL_GU = [
 ];
 
 const VIEW = {w:940, h:700, pad:16};
+/* The two closest points - 서울시립대 and 안암로 고려대 앞 - sit 52 units apart
+   on this projection, and the sun glyph draws about 1.1x its nominal size. Past
+   ~44 those two icons start to touch, so this is the largest that stays clean
+   at every point. */
+const WX_SIZE = 40;
 let lo0=180, lo1=-180, la0=90, la1=-90;
 SEOUL_GU.forEach(g => g.p.forEach(([x, y]) => {
   if (x < lo0) lo0 = x; if (x > lo1) lo1 = x;
@@ -307,8 +324,8 @@ function drawMap() {
       <circle class="body" cx="${x}" cy="${y}" r="${r}" fill="${color}"
         stroke="#fff" stroke-width="2"/>
       <circle class="hit" cx="${x}" cy="${y}" r="17"/>
-      ${wx ? wxGlyph(x + r + 7, y - r - 5, 13, wx.raining) : ''}
-      ${(on || s.live) ? `<text class="pin-name" x="${x}" y="${y - r - 12}">${s.name}</text>` : ''}
+      ${wx ? wxGlyph(x + r + 17, y - r - 13, WX_SIZE, wx.raining) : ''}
+      ${(on || s.live) ? `<text class="pin-name" x="${x}" y="${y - r - 8}">${s.name}</text>` : ''}
     </g>`);
   });
 
@@ -324,9 +341,10 @@ function wxText() {
   if (w.raining === null || w.raining === undefined)
     return `<span style="font-weight:400;color:var(--dim)">${w.error ? '조회 실패' : '판정 전'}</span>`;
   const when = w.base_time ? ` <span style="font-weight:400;color:var(--faint)">(${w.base_time.slice(0,2)}시 관측)</span>` : '';
+  const icon = `<svg class="wx-inline" viewBox="0 0 16 16">${wxGlyph(8, 8, 13, w.raining)}</svg>`;
   return w.raining
-    ? `<span style="color:#1d4ed8">강우</span>${w.rn1 ? ' ' + w.rn1 + ' mm' : ''}${when}`
-    : `<span style="color:#a16207">비강우</span>${when}`;
+    ? `${icon}<span style="color:#1d4ed8">강우</span>${w.rn1 ? ' ' + w.rn1 + ' mm' : ''}${when}`
+    : `${icon}<span style="color:#a16207">비강우</span>${when}`;
 }
 
 function drawDetail() {
@@ -387,10 +405,22 @@ function drawLegend() {
   }).join('');
 }
 
+/* Only claims the KMA link is up once a reading has actually come back: a key
+   that is present but rejected must not read as connected. */
+function wxConn(w) {
+  const box = document.getElementById('wxconn');
+  if (!w || !w.enabled) { box.innerHTML = ''; return; }
+  const ok = w.last_ok && !w.error;
+  box.innerHTML = `<i class="${ok ? 'up' : 'down'}"></i>` +
+    (ok ? '기상청 연결됨' : '기상청 연결 실패');
+}
+
 function render() {
   if (!data) return;
   const conn = document.getElementById('conn');
-  conn.textContent = data.serial_ok ? '실측 연결됨' : '실측 연결 끊김';
+  conn.innerHTML = `<i class="${data.serial_ok ? 'up' : 'down'}"></i>` +
+    (data.serial_ok ? '실측 연결됨' : '실측 연결 끊김');
+  wxConn(data.weather);
   wxChip(data.weather);
   drawMap(); drawDetail(); drawList(); drawLegend();
 }
