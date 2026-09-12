@@ -64,6 +64,11 @@ h3.sub { font-size: 12px; font-weight: 600; color: var(--dim);
 #summary { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
            padding: 10px 16px; border-bottom: 1px solid var(--line);
            background: #12151b; font-size: 12px; color: var(--dim); }
+#weather { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+           padding: 9px 16px; border-bottom: 1px solid var(--line);
+           background: #10131a; font-size: 12px; color: var(--dim); }
+#weather button { padding: 3px 8px; font-size: 11px; }
+#weather .on { color: var(--accent); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -81,6 +86,7 @@ h3.sub { font-size: 12px; font-weight: 600; color: var(--dim);
 </header>
 
 <div id="summary"></div>
+<div id="weather"></div>
 
 <div class="grid" id="cards"></div>
 
@@ -352,6 +358,37 @@ function summaryOf(nodes, levels) {
   return {fill, level: levelFor(fill, levels), count: got.length};
 }
 
+/* The rain profile switch. The server holds the decision so a page reload
+   cannot change what the nodes are running; this only reports it and offers
+   the two manual overrides. */
+function weatherStrip(w, now) {
+  const box = document.getElementById('weather');
+  if (!w || !w.enabled) {
+    box.innerHTML = `<span>기상 연동 <b>꺼짐</b> — 서버를 <code>--kma-key</code>와
+      함께 실행하면 강우 여부에 따라 주기를 자동으로 바꿉니다.</span>`;
+    return;
+  }
+  const p = w.profiles || {};
+  const prof = k => p[k] ? `${p[k][0]}s/${p[k][1]}s ×${p[k][2]}` : '—';
+  const state = w.raining === null || w.raining === undefined
+    ? '<b>판정 전</b>'
+    : (w.raining ? '<b class="on">강우</b>' : '<b>비강우</b>');
+  const seen = w.last_ok ? ago(w.last_ok, now) : '없음';
+
+  box.innerHTML = `
+    <span>기상 ${state}</span>
+    <span>PTY <b>${w.pty ?? '—'}</b> · RN1 <b>${w.rn1 ?? '—'}</b> mm</span>
+    <span>관측 <b>${w.base_date ? w.base_time : '—'}</b> · 조회 <b>${seen}</b></span>
+    <span>비강우 <b>${prof('dry')}</b> / 강우 <b>${prof('rain')}</b></span>
+    <button onclick="weatherAuto(${!w.auto})">자동 전환 ${w.auto ? '켜짐' : '꺼짐'}</button>
+    <button onclick="weatherForce('dry')">비강우 적용</button>
+    <button onclick="weatherForce('rain')">강우 적용</button>
+    ${w.error ? `<span style="color:var(--bad)">조회 실패: ${w.error}</span>` : ''}`;
+}
+
+async function weatherAuto(on) { alert((await post('/api/weather', {auto: on})).msg); }
+async function weatherForce(k) { alert((await post('/api/weather', {force: k})).msg); }
+
 function ago(t, now) {
   if (!t) return '—';
   const d = now - t;
@@ -389,6 +426,7 @@ function render() {
        <b style="color:${site.level.color};font-size:15px">${site.fill.toFixed(0)}% 적치</b>
        <span>서울시립대학교 · 센서 ${site.count}대 평균 · 사용자 지도에 이 값이 나갑니다</span>`
     : '<span>지점 판정 대기 — baseline과 프레임이 모두 있어야 계산됩니다</span>';
+  weatherStrip(state.weather, state.now);
 
   cards.innerHTML = state.nodes.map(node => {
     const s = state.settings[String(node.node)];

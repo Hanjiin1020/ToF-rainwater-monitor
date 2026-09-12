@@ -39,7 +39,15 @@ body { margin:0; background:var(--wash); color:var(--ink);
 
 .panel { background:var(--white); border:1px solid var(--line); border-radius:4px; }
 .panel > h2 { margin:0; padding:14px 18px; font-size:14px; font-weight:700;
-              color:var(--navy); border-bottom:1px solid var(--line); }
+              color:var(--navy); border-bottom:1px solid var(--line);
+              display:flex; align-items:center; justify-content:space-between;
+              gap:10px; }
+.wx { display:inline-flex; align-items:center; gap:6px; font-size:12px;
+      font-weight:700; padding:3px 10px; border-radius:3px; }
+.wx.rain { color:#1d4ed8; background:#eaf1fe; border:1px solid #c5d9fb; }
+.wx.dry  { color:#a16207; background:#fdf6e3; border:1px solid #f0e0b0; }
+.wx.off  { color:var(--faint); background:var(--wash); border:1px solid var(--line); }
+.wx svg { width:15px; height:15px; }
 .panel .body { padding:16px 18px 18px; }
 
 svg.map { width:100%; height:auto; display:block; }
@@ -120,7 +128,7 @@ footer { max-width:1240px; margin:0 auto; padding:0 22px 34px;
 
 <div class="wrap">
   <div class="panel">
-    <h2>지도에서 선택</h2>
+    <h2>지도에서 선택 <span id="wx"></span></h2>
     <div class="body">
       <svg class="map" id="map" viewBox="0 0 940 700"></svg>
       <div class="legend" id="legend"></div>
@@ -214,6 +222,59 @@ function ago(t, now) {
   return `${(d/3600).toFixed(1)}시간 전`;
 }
 
+/* Sun and rain cloud drawn from primitives, like everything else on this
+   page - no icon font, no sprite sheet. Kept muted so it never competes with
+   the status colour of the dot it sits beside. */
+function wxGlyph(cx, cy, size, raining) {
+  const s = size, n = (v) => (Math.round(v * 100) / 100);
+  if (!raining) {
+    const r = s * 0.26;
+    let rays = '';
+    for (let i = 0; i < 8; i++) {
+      const a = i * Math.PI / 4;
+      rays += `<line x1="${n(cx + Math.cos(a) * r * 1.5)}"
+                     y1="${n(cy + Math.sin(a) * r * 1.5)}"
+                     x2="${n(cx + Math.cos(a) * r * 2.1)}"
+                     y2="${n(cy + Math.sin(a) * r * 2.1)}"/>`;
+    }
+    return `<g class="wxg" pointer-events="none">
+      <circle cx="${n(cx)}" cy="${n(cy)}" r="${n(r)}" fill="#f59e0b"/>
+      <g stroke="#f59e0b" stroke-width="${n(s * 0.11)}" stroke-linecap="round">
+        ${rays}</g></g>`;
+  }
+  const top = cy - s * 0.16;
+  return `<g class="wxg" pointer-events="none">
+    <g fill="#8fb2e3">
+      <circle cx="${n(cx - s * 0.26)}" cy="${n(top + s * 0.1)}" r="${n(s * 0.22)}"/>
+      <circle cx="${n(cx + s * 0.02)}" cy="${n(top)}" r="${n(s * 0.3)}"/>
+      <circle cx="${n(cx + s * 0.3)}" cy="${n(top + s * 0.12)}" r="${n(s * 0.2)}"/>
+      <rect x="${n(cx - s * 0.28)}" y="${n(top + s * 0.06)}"
+            width="${n(s * 0.58)}" height="${n(s * 0.26)}" rx="${n(s * 0.1)}"/>
+    </g>
+    <g stroke="#3b82f6" stroke-width="${n(s * 0.13)}" stroke-linecap="round">
+      <line x1="${n(cx - s * 0.14)}" y1="${n(cy + s * 0.26)}"
+            x2="${n(cx - s * 0.24)}" y2="${n(cy + s * 0.5)}"/>
+      <line x1="${n(cx + s * 0.16)}" y1="${n(cy + s * 0.26)}"
+            x2="${n(cx + s * 0.06)}" y2="${n(cy + s * 0.5)}"/>
+    </g></g>`;
+}
+
+function wxChip(w) {
+  const box = document.getElementById('wx');
+  if (!w || !w.enabled) {
+    box.className = 'wx off'; box.textContent = '기상 연동 꺼짐'; return;
+  }
+  if (w.raining === null || w.raining === undefined) {
+    box.className = 'wx off';
+    box.textContent = w.error ? '기상 조회 실패' : '기상 판정 전';
+    return;
+  }
+  box.className = 'wx ' + (w.raining ? 'rain' : 'dry');
+  box.innerHTML =
+    `<svg viewBox="0 0 16 16">${wxGlyph(8, 8, 13, w.raining)}</svg>` +
+    (w.raining ? `강우 ${w.rn1 ? w.rn1 + ' mm' : ''}` : '비강우');
+}
+
 function drawMap() {
   const site = data.sites.find(s => s.id === selected);
   const onGu = site ? districtAt(site.lon, site.lat) : null;
@@ -228,6 +289,11 @@ function drawMap() {
     out.push(`<text class="gu-name" x="${x}" y="${y}">${g.n}</text>`);
   });
 
+  /* One observation covers all ten points: they are a grid cell or two apart
+     inside Seoul. Nothing is drawn until a real reading has arrived. */
+  const w = data.weather;
+  const wx = (w && w.enabled && w.raining !== null && w.raining !== undefined)
+    ? w : null;
   data.sites.forEach(s => {
     const [x, y] = px(s.lon, s.lat);
     const color = s.level ? s.level.color : '#94a0b1';
@@ -241,7 +307,8 @@ function drawMap() {
       <circle class="body" cx="${x}" cy="${y}" r="${r}" fill="${color}"
         stroke="#fff" stroke-width="2"/>
       <circle class="hit" cx="${x}" cy="${y}" r="17"/>
-      ${(on || s.live) ? `<text class="pin-name" x="${x}" y="${y - r - 8}">${s.name}</text>` : ''}
+      ${wx ? wxGlyph(x + r + 7, y - r - 5, 13, wx.raining) : ''}
+      ${(on || s.live) ? `<text class="pin-name" x="${x}" y="${y - r - 12}">${s.name}</text>` : ''}
     </g>`);
   });
 
@@ -249,6 +316,17 @@ function drawMap() {
   map.innerHTML = out.join('');
   map.querySelectorAll('.dot').forEach(g =>
     g.addEventListener('click', () => { selected = g.dataset.id; render(); }));
+}
+
+function wxText() {
+  const w = data.weather;
+  if (!w || !w.enabled) return '<span style="font-weight:400;color:var(--dim)">연동 꺼짐</span>';
+  if (w.raining === null || w.raining === undefined)
+    return `<span style="font-weight:400;color:var(--dim)">${w.error ? '조회 실패' : '판정 전'}</span>`;
+  const when = w.base_time ? ` <span style="font-weight:400;color:var(--faint)">(${w.base_time.slice(0,2)}시 관측)</span>` : '';
+  return w.raining
+    ? `<span style="color:#1d4ed8">강우</span>${w.rn1 ? ' ' + w.rn1 + ' mm' : ''}${when}`
+    : `<span style="color:#a16207">비강우</span>${when}`;
 }
 
 function drawDetail() {
@@ -260,7 +338,8 @@ function drawDetail() {
     box.innerHTML = `<div class="site-name">${s.name}</div>
       <div class="site-addr">${s.addr}</div>
       <span class="pill" style="background:#94a0b1">측정 대기</span>
-      <dl class="meta"><dt>행정구역</dt><dd>${gu || '—'}</dd>
+      <dl class="meta"><dt>기상</dt><dd>${wxText()}</dd>
+      <dt>행정구역</dt><dd>${gu || '—'}</dd>
       <dt>안내</dt><dd style="font-weight:400;color:var(--dim)">
       아직 판정할 측정값이 없습니다.${s.live
         ? ' 관리자 화면에서 빈 상태의 기준면을 먼저 설정해야 합니다.' : ''}</dd></dl>`;
@@ -277,6 +356,7 @@ function drawDetail() {
     <div class="scale"><span>0</span><span>25</span><span>50</span><span>75</span><span>100</span></div>
     <p style="margin:12px 0 0;color:var(--dim);font-size:13px">${s.level.note}</p>
     <dl class="meta">
+      <dt>기상</dt><dd>${wxText()}</dd>
       <dt>행정구역</dt><dd>${gu || '—'}</dd>
       <dt>갱신</dt><dd>${ago(s.updated, data.now)}</dd>
       <dt>구분</dt><dd>${s.live
@@ -311,6 +391,7 @@ function render() {
   if (!data) return;
   const conn = document.getElementById('conn');
   conn.textContent = data.serial_ok ? '실측 연결됨' : '실측 연결 끊김';
+  wxChip(data.weather);
   drawMap(); drawDetail(); drawList(); drawLegend();
 }
 

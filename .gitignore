@@ -27,6 +27,11 @@ managed_components/
 # (MIT); vendoring the whole tree here would bury a second git repo inside this one.
 external/
 
+# API 인증키. public 저장소이므로 절대 커밋하지 않는다.
+Key
+*.key
+.env
+
 compile_commands.json
 __pycache__/
 .DS_Store

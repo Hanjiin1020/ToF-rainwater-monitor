@@ -15,11 +15,16 @@ Close `idf.py monitor` first: only one program can hold the serial port.
 
 import argparse
 import glob
+import os
 import statistics
 import json
 import queue
+import re
 import threading
 import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -81,6 +86,26 @@ LEVELS = [
 ]
 
 
+# ---- 강우 연동 프로파일 -------------------------------------------------
+#
+# (sleep_s, wake_s, measure_count). wake 10초 동안 10회 측정해 평균내는 것은
+# 두 상황에서 같고, 달라지는 것은 얼마나 자주 깨어나느냐 뿐이다.
+#
+# 현장 운용값은 비강우 3시간 / 강우 20분이다. 그런데 3시간은 펌웨어의
+# CONFIG_MAX_SLEEP_S(3600초)를 넘어 지금은 설정할 수 없다. 상한을 올리려면
+# A와 B 양쪽을 다시 flash해야 한다.
+FIELD_PROFILES = {"dry": (10800, 10, 10), "rain": (1200, 10, 10)}
+# 시연용. 몇 분 안에 두 상태를 모두 보여줘야 하므로 주기만 줄였다.
+DEMO_PROFILES = {"dry": (30, 10, 10), "rain": (20, 10, 10)}
+
+# 기상청 단기예보 조회서비스 - 초단기실황. 매시 정시 관측이고 40분 이후 제공된다.
+KMA_URL = ("http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0"
+           "/getUltraSrtNcst")
+# 서울특별시 동대문구 서울시립대로 163 을 기상청 DFS 격자로 변환한 값.
+KMA_NX, KMA_NY = 61, 127
+KMA_POLL_S = 300
+
+
 def level_for(fill_pct):
     chosen = LEVELS[0]
     for level in LEVELS:
@@ -135,6 +160,9 @@ def sites_payload(store):
                 if n.get("assessment") and n["assessment"].get("fill_pct") is not None]
     now = time.time()
 
+    # All ten points sit inside Seoul, a grid cell or two apart, so one
+    # observation describes the weather over every one of them.
+    weather = snapshot.get("weather") or {}
     out = []
     for site in SEOUL_SITES:
         entry = {k: site[k] for k in ("id", "name", "addr", "lon", "lat")}
@@ -154,7 +182,10 @@ def sites_payload(store):
         entry["level"] = None if fill is None else level_for(fill)
         out.append(entry)
     return {"now": now, "levels": LEVELS, "sites": out,
-            "serial_ok": snapshot["serial_ok"]}
+            "serial_ok": snapshot["serial_ok"],
+            "weather": {k: weather.get(k) for k in
+                        ("enabled", "raining", "pty", "rn1",
+                         "base_date", "base_time", "last_ok", "error")}}
 
 
 def default_node_settings():
@@ -226,6 +257,14 @@ class Store:
         self.settings = {nid: default_node_settings() for nid in NODE_IDS}
         self.log = []          # recent lines from A, for the page
         self.serial_ok = False
+        # Filled in by main() once the key and profile set are known. `auto`
+        # is what the operator toggles; `raining` stays None until the first
+        # successful reading so the watcher can tell "no data yet" from "dry".
+        self.weather = {
+            "enabled": False, "auto": True, "raining": None,
+            "pty": None, "rn1": None, "base_date": None, "base_time": None,
+            "last_ok": None, "error": None, "profiles": None, "poll_s": None,
+        }
         self.load()
 
     # ---- persistence -------------------------------------------------
@@ -313,6 +352,17 @@ class Store:
                     windows.append((event.get("wakes"), distances, mask))
                     del windows[:-(FILL_FRAMES * 4)]
 
+    def set_weather(self, **fields):
+        with self.lock:
+            self.weather.update(fields)
+            if fields.get("error") is None and "raining" in fields:
+                self.weather["last_ok"] = time.time()
+
+    def set_weather_auto(self, auto):
+        with self.lock:
+            self.weather["auto"] = bool(auto)
+        return self.weather["auto"]
+
     # ---- reads -------------------------------------------------------
     def snapshot(self):
         with self.lock:
@@ -327,6 +377,7 @@ class Store:
                 "serial_ok": self.serial_ok,
                 "now": time.time(),
                 "levels": LEVELS,
+                "weather": dict(self.weather),
                 "nodes": nodes,
                 "settings": {str(nid): dict(self.settings[nid])
                              for nid in NODE_IDS},
@@ -494,6 +545,108 @@ class Store:
         self.save()
 
 
+class WeatherWatcher:
+    """Follows the KMA observation and switches the nodes between the rain and
+    dry profiles.
+
+    It only sends CFG when the rain state actually changes. Sending every poll
+    would fight whatever the operator set by hand, and a bridge restart would
+    make the revision walk forward for nothing. A manual CFG therefore stays in
+    force until the weather itself flips."""
+
+    def __init__(self, store, link, service_key, profiles, poll_s=KMA_POLL_S):
+        self.store = store
+        self.link = link
+        self.key = service_key
+        self.profiles = profiles
+        self.poll_s = poll_s
+        self.stop = threading.Event()
+
+    # ---- KMA ---------------------------------------------------------
+    @staticmethod
+    def _base_slot(now=None):
+        """The most recent hourly observation that has actually been published.
+
+        Observations are taken on the hour and go out at :40, so before :41 the
+        current hour does not exist yet and the previous one is the freshest
+        answer. Backing off a flat 45 minutes instead would quietly serve an
+        hour-old reading for the first five minutes after every publication."""
+        t = now or datetime.now()
+        if t.minute < 41:
+            t -= timedelta(hours=1)
+        return t.strftime("%Y%m%d"), t.strftime("%H00")
+
+    def _fetch(self):
+        base_date, base_time = self._base_slot()
+        # data.go.kr hands out the same key in two spellings - "Encoding"
+        # (percent-escaped) and "Decoding" (raw base64 with + / =). Escaping the
+        # encoded one again turns %2B into %252B and the gateway answers 403.
+        # Unquoting first normalises both forms; a decoded key has no % in it,
+        # so this leaves it untouched.
+        key = urllib.parse.quote(urllib.parse.unquote(self.key), safe="")
+        query = urllib.parse.urlencode({
+            "pageNo": 1, "numOfRows": 20,
+            "dataType": "JSON", "base_date": base_date,
+            "base_time": base_time, "nx": KMA_NX, "ny": KMA_NY,
+        }, quote_via=urllib.parse.quote)
+        query = f"serviceKey={key}&{query}"
+        with urllib.request.urlopen(f"{KMA_URL}?{query}", timeout=15) as reply:
+            text = reply.read().decode("utf-8")
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            # The gateway answers XML for key and quota problems even when
+            # dataType=JSON was asked for.
+            reason = re.search(r"<returnAuthMsg>(.*?)</returnAuthMsg>", text)
+            raise ValueError(reason.group(1) if reason else text[:200]) from None
+
+        body = payload.get("response", {}).get("body")
+        if not body:
+            header = payload.get("response", {}).get("header", {})
+            raise ValueError(header.get("resultMsg") or "응답에 body가 없습니다")
+        items = body.get("items", {}).get("item", [])
+        values = {item["category"]: item["obsrValue"] for item in items}
+
+        pty = int(values.get("PTY", 0))
+        raw_rn1 = values.get("RN1", "0")
+        try:
+            rn1 = float(str(raw_rn1).replace("강수없음", "0") or 0)
+        except ValueError:
+            rn1 = 0.0
+        # PTY 0 is "none"; anything else is some form of precipitation. RN1 is
+        # kept as a second opinion for the case where PTY has not caught up.
+        return {"raining": pty != 0 or rn1 > 0.0, "pty": pty, "rn1": rn1,
+                "base_date": base_date, "base_time": base_time}
+
+    # ---- loop --------------------------------------------------------
+    def apply(self, raining, note):
+        sleep_s, wake_s, measure = self.profiles["rain" if raining else "dry"]
+        for node_id in NODE_IDS:
+            self.link.send(f"CFG {node_id} {sleep_s} {wake_s} {measure}")
+        self.store.add_log(
+            f"기상 연동: {'강우' if raining else '비강우'} → "
+            f"{sleep_s}s/{wake_s}s x{measure} ({note})", echo=True)
+
+    def run(self):
+        while not self.stop.wait(0 if self.store.weather["last_ok"] is None
+                                 else self.poll_s):
+            if self.stop.is_set():
+                return
+            try:
+                reading = self._fetch()
+            except Exception as exc:            # network, key, or schema
+                self.store.set_weather(error=f"{type(exc).__name__}: {exc}")
+                continue
+
+            previous = self.store.weather["raining"]
+            self.store.set_weather(error=None, **reading)
+            if not self.store.weather["auto"]:
+                continue
+            if previous is None or previous != reading["raining"]:
+                self.apply(reading["raining"],
+                           "첫 판정" if previous is None else "상태 변화")
+
+
 class SerialLink:
     """Reader thread plus a writer queue for commands going to A."""
 
@@ -559,6 +712,7 @@ class SerialLink:
 class Handler(BaseHTTPRequestHandler):
     store: Store = None      # set in main()
     link: SerialLink = None
+    watcher = None
 
     def log_message(self, fmt, *args):
         pass  # the default handler spams stderr for every poll
@@ -612,6 +766,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": True}))
             return
 
+        if self.path == "/api/weather":
+            if "auto" in body:
+                state = self.store.set_weather_auto(body["auto"])
+                self._send(200, json.dumps(
+                    {"ok": True, "auto": state,
+                     "msg": f"기상 자동 전환 {'켬' if state else '끔'}"}))
+                return
+            force = body.get("force")
+            if force in ("rain", "dry") and self.watcher:
+                self.watcher.apply(force == "rain", "수동 지정")
+                self._send(200, json.dumps(
+                    {"ok": True, "msg": f"{'강우' if force == 'rain' else '비강우'}"
+                                        " 프로파일을 보냈습니다"}))
+                return
+            self._send(400, json.dumps({"error": "bad request"}))
+            return
+
         node_id = body.get("node")
         if node_id not in NODE_IDS:
             self._send(400, json.dumps({"error": "bad node"}))
@@ -661,6 +832,14 @@ def main():
                         help="serial port of node A (default: first usbserial)")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--http-port", type=int, default=8765)
+    parser.add_argument("--kma-key", default=os.environ.get("KMA_SERVICE_KEY"),
+                        help="공공데이터포털 일반 인증키(Decoding). 없으면 기상 "
+                             "연동을 끕니다. 환경변수 KMA_SERVICE_KEY 도 됩니다")
+    parser.add_argument("--field-profiles", action="store_true",
+                        help="시연용(30s/20s) 대신 현장 운용값(3시간/20분)을 씁니다. "
+                             "3시간은 현재 펌웨어 상한 3600초를 넘습니다")
+    parser.add_argument("--weather-poll", type=int, default=KMA_POLL_S,
+                        help="기상청 조회 간격(초)")
     args = parser.parse_args()
 
     port = args.port or guess_port()
@@ -671,17 +850,39 @@ def main():
     link = SerialLink(port, args.baud, store)
     threading.Thread(target=link.run, daemon=True).start()
 
+    profiles = FIELD_PROFILES if args.field_profiles else DEMO_PROFILES
+    store.weather.update({"profiles": profiles, "poll_s": args.weather_poll,
+                          "enabled": bool(args.kma_key)})
+
+    watcher = None
+    if args.kma_key:
+        watcher = WeatherWatcher(store, link, args.kma_key, profiles,
+                                 args.weather_poll)
+        threading.Thread(target=watcher.run, daemon=True).start()
+
     Handler.store = store
     Handler.link = link
+    Handler.watcher = watcher
     server = ThreadingHTTPServer(("127.0.0.1", args.http_port), Handler)
     print(f"serial : {port} @ {args.baud}")
     print(f"open   : http://127.0.0.1:{args.http_port}")
+    kind = "현장 운용값" if args.field_profiles else "시연값"
+    print(f"프로파일: {kind}  비강우 {profiles['dry'][0]}s / "
+          f"강우 {profiles['rain'][0]}s  (wake {profiles['dry'][1]}s x"
+          f"{profiles['dry'][2]})")
+    if watcher:
+        print(f"기상   : 기상청 초단기실황 nx={KMA_NX} ny={KMA_NY}, "
+              f"{args.weather_poll}초마다 조회")
+    else:
+        print("기상   : 꺼짐 (--kma-key 를 주면 자동 전환합니다)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nstopping")
     finally:
         link.stop.set()
+        if watcher:
+            watcher.stop.set()
 
 
 if __name__ == "__main__":
