@@ -774,11 +774,26 @@ class Handler(BaseHTTPRequestHandler):
                      "msg": f"기상 자동 전환 {'켬' if state else '끔'}"}))
                 return
             force = body.get("force")
-            if force in ("rain", "dry") and self.watcher:
-                self.watcher.apply(force == "rain", "수동 지정")
+            if force in ("rain", "dry", "now") and self.watcher:
+                if force == "now":
+                    # Back to whatever the sky actually says. Needed because a
+                    # CFG by hand stays in force until the weather itself
+                    # flips, which can be hours.
+                    raining = self.store.weather["raining"]
+                    if raining is None:
+                        self._send(409, json.dumps(
+                            {"ok": False,
+                             "msg": "아직 기상 판정이 없습니다"}))
+                        return
+                    note = "현재 날씨로 복귀"
+                else:
+                    raining = force == "rain"
+                    note = "수동 지정"
+                self.watcher.apply(raining, note)
                 self._send(200, json.dumps(
-                    {"ok": True, "msg": f"{'강우' if force == 'rain' else '비강우'}"
-                                        " 프로파일을 보냈습니다"}))
+                    {"ok": True,
+                     "msg": f"{'강우' if raining else '비강우'} 프로파일을 보냈습니다"
+                            f" ({note})"}))
                 return
             self._send(400, json.dumps({"error": "bad request"}))
             return

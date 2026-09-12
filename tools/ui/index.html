@@ -381,6 +381,7 @@ function weatherStrip(w, now) {
     <span>관측 <b>${w.base_date ? w.base_time : '—'}</b> · 조회 <b>${seen}</b></span>
     <span>비강우 <b>${prof('dry')}</b> / 강우 <b>${prof('rain')}</b></span>
     <button onclick="weatherAuto(${!w.auto})">자동 전환 ${w.auto ? '켜짐' : '꺼짐'}</button>
+    <button class="primary" onclick="weatherForce('now')">지금 날씨 적용</button>
     <button onclick="weatherForce('dry')">비강우 적용</button>
     <button onclick="weatherForce('rain')">강우 적용</button>
     ${w.error ? `<span style="color:var(--bad)">조회 실패: ${w.error}</span>` : ''}`;
@@ -388,6 +389,44 @@ function weatherStrip(w, now) {
 
 async function weatherAuto(on) { alert((await post('/api/weather', {auto: on})).msg); }
 async function weatherForce(k) { alert((await post('/api/weather', {force: k})).msg); }
+
+/* The profiles live in server.py so the weather switch and these buttons can
+   never disagree. Hardcoding them here once meant the buttons still said
+   "25/10 x1" while the weather logic ran 30/20 x10, and pressing one quietly
+   dropped the node to a single frame per wake. */
+function profiles() {
+  const p = (state.weather && state.weather.profiles) || {};
+  return {dry: p.dry || [30, 10, 10], rain: p.rain || [20, 10, 10]};
+}
+
+function profileButtons(node) {
+  const p = profiles(), label = v => `${v[0]}/${v[1]} ×${v[2]}`;
+  const cfg = (v, cls, text) =>
+    `<button class="${cls}" onclick="post('/api/command',{line:'CFG ${node} ${v[0]} ${v[1]} ${v[2]}'})">${text}</button>`;
+  // Always-on reuses the profile's wake and measure count so only the sleep
+  // differs; otherwise it silently changes how many frames the average uses.
+  const always = [0, p.dry[1], p.dry[2]];
+  return cfg(p.dry, 'primary', `비강우 (${label(p.dry)})`)
+       + cfg(p.rain, '', `강우 (${label(p.rain)})`)
+       + cfg(always, '', `상시 동작 (${label(always)})`);
+}
+
+/* The cards are rebuilt on every poll, which wipes whatever is being typed
+   into the sleep/wake/measure boxes 0.7 s later. Carry the focused field
+   across the rebuild so a value can actually be entered. */
+function keepingFocus(rebuild) {
+  const live = document.activeElement;
+  const id = live && live.id;
+  if (!id) { rebuild(); return; }
+  const value = live.value;
+  const start = live.selectionStart, end = live.selectionEnd;
+  rebuild();
+  const back = document.getElementById(id);
+  if (!back) return;
+  if (value !== undefined) back.value = value;
+  back.focus();
+  try { back.setSelectionRange(start, end); } catch (e) { /* number inputs */ }
+}
 
 function ago(t, now) {
   if (!t) return '—';
@@ -428,7 +467,8 @@ function render() {
     : '<span>지점 판정 대기 — baseline과 프레임이 모두 있어야 계산됩니다</span>';
   weatherStrip(state.weather, state.now);
 
-  cards.innerHTML = state.nodes.map(node => {
+  keepingFocus(() => { cards.innerHTML = state.nodes.map(node => {
+    const dflt = profiles().dry;
     const s = state.settings[String(node.node)];
     const result = heightsOf(node, s);
     const kind = (view === 'height' && result && result.kind === 'height')
@@ -469,16 +509,11 @@ function render() {
         <span class="kv">배터리 <b>${vbatText(tel.vbat_mv)}</b></span>
       </div>
 
+      <div class="controls">${profileButtons(node.node)}</div>
       <div class="controls">
-        <button onclick="post('/api/command',{line:'CFG ${node.node} 25 10 1'})">프로파일 1 (25/10)</button>
-        <button onclick="post('/api/command',{line:'CFG ${node.node} 10 10 1'})">프로파일 2 (10/10)</button>
-        <button onclick="post('/api/command',{line:'CFG ${node.node} 0 10 1'})">상시 동작</button>
-        <button class="primary" onclick="post('/api/command',{line:'CFG ${node.node} 25 10 10'})">시연 (25/10 ×10)</button>
-      </div>
-      <div class="controls">
-        <span class="kv">sleep <input id="sl${node.node}" type="number" value="${cfg.sleep_s ?? 25}" min="0"></span>
-        <span class="kv">wake <input id="wk${node.node}" type="number" value="${cfg.wake_s ?? 10}" min="1"></span>
-        <span class="kv">측정 <input id="mc${node.node}" type="number" value="${cfg.measure ?? 1}" min="1"></span>
+        <span class="kv">sleep <input id="sl${node.node}" type="number" value="${cfg.sleep_s ?? dflt[0]}" min="0"></span>
+        <span class="kv">wake <input id="wk${node.node}" type="number" value="${cfg.wake_s ?? dflt[1]}" min="1"></span>
+        <span class="kv">측정 <input id="mc${node.node}" type="number" value="${cfg.measure ?? dflt[2]}" min="1"></span>
         <button onclick="sendCustom(${node.node})">적용</button>
       </div>
 
@@ -505,7 +540,7 @@ function render() {
       <h3 class="sub">수조 안 zone별 막대</h3>
       <canvas id="cvB${node.node}"></canvas>
     </div>`;
-  }).join('');
+  }).join(''); });
 
   state.nodes.forEach(node => {
     const s = state.settings[String(node.node)];
