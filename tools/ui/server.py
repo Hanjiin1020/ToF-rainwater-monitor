@@ -22,11 +22,17 @@ import queue
 import re
 import threading
 import time
+import socket
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+try:
+    import segno  # type: ignore - pure python, no dependencies of its own
+except ImportError:
+    segno = None
 
 try:
     import serial  # type: ignore
@@ -713,6 +719,7 @@ class Handler(BaseHTTPRequestHandler):
     store: Store = None      # set in main()
     link: SerialLink = None
     watcher = None
+    bound_host = "127.0.0.1"
 
     def log_message(self, fmt, *args):
         pass  # the default handler spams stderr for every poll
@@ -737,8 +744,32 @@ class Handler(BaseHTTPRequestHandler):
         "/survey.html": "survey.html",
     }
 
+    def is_local(self):
+        return self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+    def deny_remote(self):
+        """True when this request came from elsewhere and is not public."""
+        if self.is_local():
+            return False
+        if self.path.split("?", 1)[0] in PUBLIC_PATHS:
+            return False
+        self._send(403, json.dumps(
+            {"error": "이 주소에서는 사용자 화면만 열 수 있습니다"}))
+        return True
+
     def do_GET(self):
-        page = self.PAGES.get(self.path)
+        if self.deny_remote():
+            return
+        if self.path == "/qr":
+            url = f"http://{lan_address()}:{self.server.server_address[1]}/user"
+            self._send(200, qr_page(url, self.bound_host != "127.0.0.1",
+                                    self.bound_host),
+                       "text/html; charset=utf-8")
+            return
+        # A phone that scanned the QR and landed on "/" gets the user page, not
+        # the operator's entry screen with its link into the admin monitor.
+        page = "user.html" if (self.path == "/" and not self.is_local()) \
+            else self.PAGES.get(self.path)
         if page:
             self._send(200, (HERE / page).read_bytes(),
                        "text/html; charset=utf-8")
@@ -750,6 +781,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
+        # Nothing on this server may be changed from another machine.
+        if not self.is_local():
+            self._send(403, json.dumps({"error": "읽기 전용입니다"}))
+            return
         length = int(self.headers.get("Content-Length", 0))
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
@@ -836,6 +871,77 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, json.dumps({"error": "not found"}))
 
 
+# Paths a phone on the same network may reach. Everything else - the admin
+# monitor, the survey page, the whole command API - stays on localhost. Binding
+# to 0.0.0.0 without this would let anyone on the venue wifi open /admin and
+# send CFG to the nodes.
+PUBLIC_PATHS = frozenset({"/", "/user", "/user.html", "/api/sites"})
+
+
+def lan_address():
+    """This machine's address on the network a phone would reach it by.
+
+    Opening a UDP socket sends nothing; it just asks the routing table which
+    local address would be used, which is what we want to put in the QR. On a
+    phone hotspot with no internet there is still a default route, so this
+    keeps working."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        return probe.getsockname()[0]
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return None
+    finally:
+        probe.close()
+
+
+def qr_page(url, reachable, host):
+    """The operator's page: a QR for the phone, and the URL in plain text as a
+    fallback for when the camera will not cooperate."""
+    if segno is None:
+        body = ("<p class='bad'>segno 가 설치되어 있지 않습니다.</p>"
+                "<pre>python3 -m pip install segno</pre>")
+    elif not reachable:
+        body = (f"<p class='bad'>서버가 <code>{host}</code> 에만 열려 있어 "
+                "휴대폰에서 접속할 수 없습니다.</p>"
+                "<pre>python3 tools/ui/server.py --host 0.0.0.0 --port &lt;시리얼포트&gt;</pre>"
+                "<p>로 다시 실행한 뒤 이 페이지를 새로고침하세요.</p>")
+    else:
+        svg = segno.make(url, error="m").svg_inline(scale=9, dark="#12335c",
+                                                    light="#ffffff")
+        body = (f"<div class='qr'>{svg}</div>"
+                f"<p class='url'><a href='{url}'>{url}</a></p>"
+                "<p class='hint'>휴대폰 카메라로 찍으면 사용자 화면이 열립니다. "
+                "관리자 화면은 이 맥에서만 열립니다.</p>"
+                "<p class='hint'>네트워크가 바뀌면 주소도 바뀝니다. "
+                "핫스팟을 갈아탄 뒤에는 이 페이지를 새로고침하세요.</p>")
+    return f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>빗물 지킴이 — 접속 QR</title><style>
+body{{margin:0;min-height:100vh;display:flex;align-items:center;
+ justify-content:center;background:#f4f7fb;color:#1a1f2b;
+ font:15px/1.7 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif}}
+.card{{background:#fff;border:1px solid #dde3ec;border-radius:6px;
+ padding:36px 40px;text-align:center;max-width:560px}}
+h1{{font-size:20px;margin:0 0 6px;color:#12335c;letter-spacing:-.02em}}
+.sub{{color:#5b6472;font-size:13px;margin:0 0 26px}}
+.qr svg{{display:block;margin:0 auto}}
+.url{{margin:22px 0 4px;font-size:15px;font-weight:700;word-break:break-all}}
+.url a{{color:#1a6fd4;text-decoration:none}}
+.hint{{color:#5b6472;font-size:12px;margin:10px 0 0}}
+.bad{{color:#b91c1c;font-weight:700}}
+pre{{background:#f4f7fb;border:1px solid #dde3ec;border-radius:4px;
+ padding:10px;font-size:12px;text-align:left;overflow-x:auto}}
+</style></head><body><div class="card">
+<h1>빗물 지킴이 — 사용자 화면</h1>
+<p class="sub">휴대폰으로 접속하는 주소입니다</p>
+{body}
+</div></body></html>"""
+
+
 def guess_port():
     candidates = sorted(glob.glob("/dev/cu.usbserial*"))
     return candidates[0] if candidates else None
@@ -847,6 +953,10 @@ def main():
                         help="serial port of node A (default: first usbserial)")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--http-port", type=int, default=8765)
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="0.0.0.0 으로 주면 같은 네트워크의 휴대폰이 사용자 "
+                             "화면에 접속할 수 있습니다. 관리자 화면과 명령은 "
+                             "어느 경우에도 이 기기에서만 열립니다")
     parser.add_argument("--kma-key", default=os.environ.get("KMA_SERVICE_KEY"),
                         help="공공데이터포털 일반 인증키(Decoding). 없으면 기상 "
                              "연동을 끕니다. 환경변수 KMA_SERVICE_KEY 도 됩니다")
@@ -878,9 +988,18 @@ def main():
     Handler.store = store
     Handler.link = link
     Handler.watcher = watcher
-    server = ThreadingHTTPServer(("127.0.0.1", args.http_port), Handler)
+    Handler.bound_host = args.host
+    server = ThreadingHTTPServer((args.host, args.http_port), Handler)
     print(f"serial : {port} @ {args.baud}")
     print(f"open   : http://127.0.0.1:{args.http_port}")
+    if args.host == "127.0.0.1":
+        print("휴대폰 : 꺼짐 (--host 0.0.0.0 을 주면 QR 접속이 열립니다)")
+    else:
+        lan = lan_address()
+        print(f"휴대폰 : http://{lan}:{args.http_port}/user  "
+              f"— QR 은 http://127.0.0.1:{args.http_port}/qr")
+        if segno is None:
+            print("         (segno 미설치: pip install segno)")
     kind = "현장 운용값" if args.field_profiles else "시연값"
     print(f"프로파일: {kind}  비강우 {profiles['dry'][0]}s / "
           f"강우 {profiles['rain'][0]}s  (wake {profiles['dry'][1]}s x"
